@@ -621,6 +621,12 @@ export default function ShaderLabV2() {
   const [batchMode, setBatchMode] = useState(false);
   const [batchQueue, setBatchQueue] = useState([]);
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 });
+  // ── Infinite Canvas ──
+  const [images, setImages] = useState([]);
+  const [selectedImageId, setSelectedImageId] = useState(null);
+  const [canvasPan, setCanvasPan] = useState({ x: 0, y: 0 });
+  const [canvasZoom, setCanvasZoom] = useState(1);
+  const [isPanning, setIsPanning] = useState(false);
   const mediaRecorderRef = useRef(null);
   const recordChunksRef = useRef([]);
   const canvasRef = useRef(null);
@@ -637,6 +643,8 @@ export default function ShaderLabV2() {
   const timeRef = useRef(0);
   const lastFrameRef = useRef(0);
   const compareAreaRef = useRef(null);
+  const infiniteCanvasRef = useRef(null);
+  const panStartRef = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
 
   const activeEffect = effectStack[selectedEffectIdx] || effectStack[0];
   const activeShader = activeEffect?.shaderKey ?? "wobble";
@@ -648,6 +656,7 @@ export default function ShaderLabV2() {
     const canvas = canvasRef.current;
     if (!canvas || !image) return null;
     let gl = glRef.current;
+    if (gl && gl.canvas !== canvas) { gl = null; glRef.current = null; programCacheRef.current = {}; }
     if (!gl) { gl = canvas.getContext("webgl", { preserveDrawingBuffer: true }); if (!gl) return null; glRef.current = gl; }
 
     // Canvas sizing
@@ -788,6 +797,20 @@ export default function ShaderLabV2() {
     } else { renderFrame(0); }
   }, [image, effectStack, setupGL, renderFrame, activeFormat]);
 
+  // ── Snapshot processed image back to grid ──
+  useEffect(() => {
+    if (!selectedImageId || !image || !canvasRef.current) return;
+    const hasAnimated = effectStack.some(e => e.enabled && SHADERS[e.shaderKey]?.animated);
+    if (hasAnimated) return;
+    const timer = setTimeout(() => {
+      try {
+        const dataUrl = canvasRef.current?.toDataURL("image/png");
+        if (dataUrl) setImages(prev => prev.map(img => img.id === selectedImageId ? { ...img, processedSrc: dataUrl } : img));
+      } catch (e) { /* ignore */ }
+    }, 150);
+    return () => clearTimeout(timer);
+  }, [selectedImageId, effectStack, image, activeFormat]);
+
   // ── Image loading ──
   const handleImageLoad = (file) => {
     if (!file || !file.type.startsWith("image/")) return;
@@ -795,13 +818,26 @@ export default function ShaderLabV2() {
     reader.onload = e => {
       const img = new Image();
       img.onload = () => {
-        const mx = 1200;
+        const mx = 2400;
+        const finish = (finalImg, finalSrc) => {
+          const newId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+          const entry = {
+            id: newId, img: finalImg, src: finalSrc, processedSrc: null,
+            naturalWidth: finalImg.naturalWidth || finalImg.width,
+            naturalHeight: finalImg.naturalHeight || finalImg.height,
+            name: file.name,
+          };
+          setImages(prev => [...prev, entry]);
+          setSelectedImageId(newId);
+          setImage(finalImg);
+          setImageSrc(finalSrc);
+        };
         if (img.width > mx || img.height > mx) {
           const sc = mx / Math.max(img.width, img.height);
           const c = document.createElement("canvas"); c.width = img.width * sc; c.height = img.height * sc;
           c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
-          const si = new Image(); si.onload = () => { setImage(si); setImageSrc(c.toDataURL()); }; si.src = c.toDataURL();
-        } else { setImage(img); setImageSrc(e.target.result); }
+          const si = new Image(); si.onload = () => finish(si, c.toDataURL()); si.src = c.toDataURL();
+        } else { finish(img, e.target.result); }
       };
       img.src = e.target.result;
     };
@@ -811,8 +847,7 @@ export default function ShaderLabV2() {
   const handleDrop = e => {
     e.preventDefault(); setIsDragging(false);
     const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith("image/"));
-    if (files.length > 1) { setBatchMode(true); setTab("batch"); addFilesToQueue(files); }
-    else if (files.length === 1) { handleImageLoad(files[0]); }
+    files.forEach(f => handleImageLoad(f));
   };
 
   // ── Effect Stack ──
@@ -862,6 +897,113 @@ export default function ShaderLabV2() {
   const resetParams = () => {
     setEffectStack(prev => prev.map((e, i) => i === selectedEffectIdx ? { ...e, params: {} } : e));
   };
+
+  // ── Image Selection ──
+  const handleSelectImage = useCallback((id) => {
+    if (id === selectedImageId) return;
+    if (selectedImageId && canvasRef.current && image) {
+      try {
+        const dataUrl = canvasRef.current.toDataURL("image/png");
+        setImages(prev => prev.map(img => img.id === selectedImageId ? { ...img, processedSrc: dataUrl } : img));
+      } catch (e) { /* ignore */ }
+    }
+    const found = images.find(i => i.id === id);
+    if (found) {
+      setSelectedImageId(id);
+      setImage(found.img);
+      setImageSrc(found.src);
+    }
+  }, [selectedImageId, images, image]);
+
+  const handleRemoveImage = useCallback((id) => {
+    setImages(prev => prev.filter(i => i.id !== id));
+    if (selectedImageId === id) {
+      setSelectedImageId(null);
+      setImage(null);
+      setImageSrc(null);
+    }
+  }, [selectedImageId]);
+
+  const clearAllImages = () => {
+    setImages([]); setSelectedImageId(null); setImage(null); setImageSrc(null);
+  };
+
+  // ── Infinite Canvas: Grid Layout ──
+  const GRID_COL_W = 300;
+  const GRID_GAP = 16;
+
+  const gridLayout = useMemo(() => {
+    const containerW = infiniteCanvasRef.current?.clientWidth || 1000;
+    const numCols = Math.max(1, Math.floor((containerW - GRID_GAP) / (GRID_COL_W + GRID_GAP)));
+    const totalGridW = numCols * GRID_COL_W + (numCols - 1) * GRID_GAP;
+    const startX = Math.max(GRID_GAP, (containerW - totalGridW) / 2);
+    const colHeights = new Array(numCols).fill(GRID_GAP);
+
+    const items = images.map(img => {
+      const shortestCol = colHeights.indexOf(Math.min(...colHeights));
+      const aspect = img.naturalHeight / img.naturalWidth;
+      const w = GRID_COL_W;
+      const h = w * aspect;
+      const x = startX + shortestCol * (GRID_COL_W + GRID_GAP);
+      const y = colHeights[shortestCol];
+      colHeights[shortestCol] += h + GRID_GAP;
+      return { ...img, gx: x, gy: y, gw: w, gh: h };
+    });
+
+    const shortestCol = colHeights.indexOf(Math.min(...colHeights));
+    const addBtnPos = {
+      x: startX + shortestCol * (GRID_COL_W + GRID_GAP),
+      y: colHeights[shortestCol],
+    };
+
+    return { items, addBtnPos };
+  }, [images]);
+
+  // ── Infinite Canvas: Pan & Zoom ──
+  const handleCanvasWheel = useCallback((e) => {
+    e.preventDefault();
+    const rect = infiniteCanvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const factor = e.deltaY < 0 ? 1.08 : 0.92;
+    setCanvasZoom(prev => {
+      const nz = Math.max(0.15, Math.min(5, prev * factor));
+      const scale = nz / prev;
+      setCanvasPan(p => ({ x: mx - scale * (mx - p.x), y: my - scale * (my - p.y) }));
+      return nz;
+    });
+  }, []);
+
+  const handleCanvasPanStart = useCallback((e) => {
+    if (e.button !== 0) return;
+    const tag = e.target.tagName;
+    if (tag === "IMG" || tag === "CANVAS" || tag === "BUTTON") return;
+    setIsPanning(true);
+    panStartRef.current = { x: e.clientX, y: e.clientY, panX: canvasPan.x, panY: canvasPan.y };
+  }, [canvasPan]);
+
+  const handleCanvasPanMove = useCallback((e) => {
+    if (!isPanning) return;
+    setCanvasPan({
+      x: panStartRef.current.panX + (e.clientX - panStartRef.current.x),
+      y: panStartRef.current.panY + (e.clientY - panStartRef.current.y),
+    });
+  }, [isPanning]);
+
+  const handleCanvasPanEnd = useCallback(() => { setIsPanning(false); }, []);
+
+  const fitAll = useCallback(() => {
+    setCanvasPan({ x: 0, y: 0 });
+    setCanvasZoom(1);
+  }, []);
+
+  useEffect(() => {
+    const el = infiniteCanvasRef.current;
+    if (!el) return;
+    el.addEventListener("wheel", handleCanvasWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleCanvasWheel);
+  }, [handleCanvasWheel]);
 
   // ── Batch Processing ──
   const addFilesToQueue = (files) => {
@@ -1151,6 +1293,8 @@ export default function ShaderLabV2() {
         input[type=range]{-webkit-appearance:none;width:100%;height:3px;background:${S.subtle};border-radius:2px;outline:none}
         input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#fff;cursor:pointer;border:2px solid ${S.bg};box-shadow:0 0 6px rgba(139,92,246,0.3)}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+        .img-card .img-remove{opacity:0;transition:opacity .15s}
+        .img-card:hover .img-remove{opacity:1}
         .btn{padding:7px 12px;border:1px solid ${S.border};border-radius:6px;font-size:10px;cursor:pointer;letter-spacing:.04em;font-family:inherit;transition:all .15s}
         .btn:hover{border-color:${S.accent};color:#fff}
         .btn-primary{background:${S.accent};border-color:${S.accent};color:#fff;font-weight:600}
@@ -1167,7 +1311,7 @@ export default function ShaderLabV2() {
             <span style={{ fontSize: 10, color: S.dim, fontWeight: 400, marginLeft: 8 }}>v2.1</span>
           </h1>
         </div>
-        {image && (
+        {images.length > 0 && (
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
             <button className="btn" onClick={() => setCompareMode(!compareMode)}
               style={{ background: compareMode ? S.subtle : "transparent", color: compareMode ? "#fff" : S.muted }}>
@@ -1207,7 +1351,7 @@ export default function ShaderLabV2() {
                 {"\u2193"} ZIP ({batchQueue.filter(q => q.status === "done").length})
               </button>
             )}
-            <button className="btn" onClick={() => { setImage(null); setImageSrc(null); }} style={{ background: "transparent", color: S.dim }}>{"\u2715"}</button>
+            <button className="btn" onClick={clearAllImages} style={{ background: "transparent", color: S.dim }}>{"\u2715"}</button>
           </div>
         )}
       </div>
@@ -1424,112 +1568,152 @@ export default function ShaderLabV2() {
 
         {/* ── MAIN AREA (canvas + params) ── */}
         <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
-        <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", position: "relative", overflow: "hidden" }}>
-          {!image ? (
-            <div onDragOver={e => { e.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)}
-              onDrop={handleDrop} onClick={() => fileInputRef.current?.click()}
+        <div ref={infiniteCanvasRef} style={{ flex: 1, position: "relative", overflow: "hidden", cursor: isPanning ? "grabbing" : "default" }}
+          onMouseDown={handleCanvasPanStart} onMouseMove={handleCanvasPanMove} onMouseUp={handleCanvasPanEnd} onMouseLeave={handleCanvasPanEnd}
+          onDragOver={e => { e.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={handleDrop}>
+          <input ref={fileInputRef} type="file" accept="image/*" multiple
+            onChange={e => { Array.from(e.target.files).forEach(f => handleImageLoad(f)); e.target.value = ""; }}
+            style={{ display: "none" }} />
+          <canvas ref={origCanvasRef} style={{ display: "none" }} />
+
+          {images.length === 0 ? (
+            <div onClick={() => fileInputRef.current?.click()}
               style={{
+                position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
+                cursor: "pointer",
+              }}>
+              <div style={{
                 width: "80%", maxWidth: 500, aspectRatio: "16/10",
                 border: `2px dashed ${isDragging ? S.accent : S.border}`,
                 borderRadius: 20, display: "flex", flexDirection: "column",
-                alignItems: "center", justifyContent: "center", cursor: "pointer",
+                alignItems: "center", justifyContent: "center",
                 transition: "all .2s", background: isDragging ? "rgba(139,92,246,.03)" : "transparent",
               }}>
-              <div style={{ width: 56, height: 56, borderRadius: 14, background: S.panel, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 18, fontSize: 24, color: S.muted, border: `1px solid ${S.border}` }}>+</div>
-              <p style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 15, color: S.muted, marginBottom: 6 }}>Drop image or click to upload</p>
-              <p style={{ fontSize: 11, color: S.dim }}>PNG, JPG, WebP</p>
-              <input ref={fileInputRef} type="file" accept="image/*" onChange={e => handleImageLoad(e.target.files[0])} style={{ display: "none" }} />
+                <div style={{ width: 56, height: 56, borderRadius: 14, background: S.panel, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 18, fontSize: 24, color: S.muted, border: `1px solid ${S.border}` }}>+</div>
+                <p style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 15, color: S.muted, marginBottom: 6 }}>Drop images or click to upload</p>
+                <p style={{ fontSize: 11, color: S.dim }}>PNG, JPG, WebP — multiple allowed</p>
+              </div>
             </div>
           ) : (
-            <div ref={compareAreaRef} style={{ position: "relative", maxWidth: "90%", maxHeight: "90%", userSelect: "none" }}
-              onMouseDown={e => { if (compareMode) setDraggingCompare(true); }}
-              onTouchStart={e => { if (compareMode) setDraggingCompare(true); }}>
-
-              {/* Original canvas (hidden, for compare) */}
-              <canvas ref={origCanvasRef} style={{ display: "none" }} />
-
-              {/* Compare: original side */}
-              {compareMode && imageSrc && (
-                <div style={{
-                  position: "absolute", top: 0, left: 0, width: `${comparePos * 100}%`, height: "100%",
-                  overflow: "hidden", zIndex: 2, borderRadius: "8px 0 0 8px",
-                }}>
-                  <img src={imageSrc} alt="Original" style={{
-                    width: canvasRef.current?.offsetWidth || "100%",
-                    height: canvasRef.current?.offsetHeight || "100%",
-                    objectFit: "cover", display: "block",
-                  }} />
-                  <div style={{ position: "absolute", top: 10, left: 10, fontSize: 9, color: "#fff", background: "rgba(0,0,0,.6)", padding: "3px 8px", borderRadius: 4, letterSpacing: ".05em" }}>ORIGINAL</div>
-                </div>
-              )}
-
-              {/* Compare slider handle */}
-              {compareMode && (
-                <div style={{
-                  position: "absolute", top: 0, left: `${comparePos * 100}%`, width: 3, height: "100%",
-                  background: "#fff", zIndex: 3, cursor: "ew-resize", transform: "translateX(-50%)",
-                  boxShadow: "0 0 12px rgba(0,0,0,.5)",
-                }}>
-                  <div style={{
-                    position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)",
-                    width: 28, height: 28, borderRadius: "50%", background: "#fff",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    fontSize: 12, color: "#000", boxShadow: "0 2px 8px rgba(0,0,0,.4)",
-                  }}>◀▶</div>
-                </div>
-              )}
-
-              {compareMode && (
-                <div style={{ position: "absolute", top: 10, right: 10, fontSize: 9, color: "#fff", background: "rgba(139,92,246,.6)", padding: "3px 8px", borderRadius: 4, letterSpacing: ".05em", zIndex: 1 }}>EFFECT</div>
-              )}
-
-              <canvas ref={canvasRef} style={{
-                maxWidth: "100%", maxHeight: "calc(100vh - 200px)", borderRadius: 8, display: "block",
-                boxShadow: "0 4px 40px rgba(0,0,0,.5)",
-              }} />
-
-              {/* Export overlay */}
-              {exporting && (
-                <div style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,.7)", borderRadius: 8, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 10 }}>
-                  <div style={{ fontSize: 13, color: S.accent, fontFamily: "'Space Grotesk',sans-serif", marginBottom: 12, animation: "pulse 1.5s infinite" }}>Encoding GIF...</div>
-                  <div style={{ width: 200, height: 3, background: S.subtle, borderRadius: 2, overflow: "hidden" }}>
-                    <div style={{ width: `${exportProgress}%`, height: "100%", background: `linear-gradient(90deg, ${S.accentDim}, ${S.accent})`, borderRadius: 2, transition: "width .15s" }} />
+            <>
+              {/* Grid content with pan/zoom transform */}
+              <div style={{
+                transform: `translate(${canvasPan.x}px, ${canvasPan.y}px) scale(${canvasZoom})`,
+                transformOrigin: "0 0",
+                position: "absolute", top: 0, left: 0,
+                width: "100%", minHeight: "100%",
+              }}>
+                {gridLayout.items.map(item => (
+                  <div key={item.id} className="img-card"
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => { e.stopPropagation(); handleSelectImage(item.id); }}
+                    style={{
+                      position: "absolute", left: item.gx, top: item.gy,
+                      width: item.gw, height: item.gh,
+                      borderRadius: 8, overflow: "hidden",
+                      border: selectedImageId === item.id ? `2px solid ${S.accent}` : "2px solid transparent",
+                      boxShadow: selectedImageId === item.id ? `0 0 20px rgba(139,92,246,.3)` : "0 2px 12px rgba(0,0,0,.4)",
+                      cursor: "pointer",
+                      transition: "border-color 0.15s, box-shadow 0.15s",
+                    }}>
+                    <img src={item.processedSrc || item.src} draggable={false}
+                      style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                    <button className="img-remove"
+                      onClick={(e) => { e.stopPropagation(); handleRemoveImage(item.id); }}
+                      style={{
+                        position: "absolute", top: 6, right: 6,
+                        width: 22, height: 22, borderRadius: "50%",
+                        background: "rgba(0,0,0,.6)", border: "none",
+                        color: "#aaa", fontSize: 12, cursor: "pointer",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                      }}>{"\u2715"}</button>
+                    <div style={{
+                      position: "absolute", bottom: 0, left: 0, right: 0,
+                      padding: "20px 8px 6px", fontSize: 10, color: "#ccc",
+                      background: "linear-gradient(transparent, rgba(0,0,0,.7))",
+                      overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                      pointerEvents: "none",
+                    }}>{item.name}</div>
                   </div>
-                  <div style={{ fontSize: 10, color: S.muted, marginTop: 8 }}>{exportProgress}%</div>
-                </div>
-              )}
+                ))}
 
-              {/* Recording overlay */}
-              {recording && (
-                <div style={{ position: "absolute", inset: 0, borderRadius: 8, display: "flex", flexDirection: "column", alignItems: "flex-start", justifyContent: "flex-start", zIndex: 10, pointerEvents: "none" }}>
-                  <div style={{
-                    margin: 12, display: "flex", alignItems: "center", gap: 8,
-                    padding: "6px 12px", background: "rgba(0,0,0,.7)", borderRadius: 6,
-                    backdropFilter: "blur(4px)",
+                {/* WebGL canvas overlay for selected image */}
+                {(() => {
+                  const sel = selectedImageId ? gridLayout.items.find(i => i.id === selectedImageId) : null;
+                  return (
+                    <div style={{
+                      position: "absolute",
+                      left: sel?.gx ?? 0, top: sel?.gy ?? 0,
+                      width: sel?.gw ?? 0, height: sel?.gh ?? 0,
+                      display: sel ? "block" : "none",
+                      borderRadius: 8, overflow: "hidden", zIndex: 2,
+                      pointerEvents: "none",
+                    }}>
+                      <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
+                    </div>
+                  );
+                })()}
+
+                {/* Add image button */}
+                <div
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
+                  style={{
+                    position: "absolute",
+                    left: gridLayout.addBtnPos.x, top: gridLayout.addBtnPos.y,
+                    width: GRID_COL_W, height: 120,
+                    border: `2px dashed ${S.border}`, borderRadius: 8,
+                    display: "flex", flexDirection: "column",
+                    alignItems: "center", justifyContent: "center",
+                    cursor: "pointer", color: S.muted, fontSize: 12,
+                    fontFamily: "'Space Grotesk',sans-serif",
+                    transition: "border-color 0.15s",
                   }}>
-                    <span style={{ width: 10, height: 10, borderRadius: "50%", background: "#ef4444", animation: "pulse 1s infinite" }} />
-                    <span style={{ fontSize: 11, color: "#fff", fontFamily: "'Space Grotesk',sans-serif", fontWeight: 500 }}>
-                      REC {Math.round(recordProgress / 100 * recordSec)}/{recordSec}s
-                    </span>
-                  </div>
-                  <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 3, background: "rgba(0,0,0,.3)" }}>
-                    <div style={{ height: "100%", background: "#ef4444", width: `${recordProgress}%`, transition: "width .05s", borderRadius: "0 0 8px 8px" }} />
-                  </div>
+                  <span style={{ fontSize: 22, marginBottom: 4, opacity: 0.5 }}>+</span>
+                  Add Image
+                </div>
+              </div>
+
+              {/* Drag overlay */}
+              {isDragging && (
+                <div style={{
+                  position: "absolute", inset: 0,
+                  background: "rgba(139,92,246,.05)",
+                  border: `2px dashed ${S.accent}`,
+                  zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center",
+                  pointerEvents: "none",
+                }}>
+                  <p style={{ color: S.accent, fontSize: 16, fontFamily: "'Space Grotesk',sans-serif" }}>Drop images to add</p>
                 </div>
               )}
-            </div>
-          )}
 
-          {/* Format indicator */}
-          {image && activeFormat !== "free" && (
-            <div style={{ position: "absolute", bottom: 14, left: "50%", transform: "translateX(-50%)", padding: "5px 12px", background: S.panel, border: `1px solid ${S.border}`, borderRadius: 6, fontSize: 10, color: S.muted, letterSpacing: ".04em" }}>
-              {FORMATS[activeFormat].label} · {FORMATS[activeFormat].w}×{FORMATS[activeFormat].h}
-            </div>
+              {/* Zoom controls */}
+              <div style={{
+                position: "absolute", bottom: 12, right: 12,
+                display: "flex", gap: 4, alignItems: "center", zIndex: 10,
+              }}>
+                <button className="btn" onClick={fitAll}
+                  style={{ background: S.panel, color: S.muted, fontSize: 9, padding: "5px 8px" }}>FIT</button>
+                <span style={{ fontSize: 10, color: S.dim, padding: "0 6px", fontVariantNumeric: "tabular-nums" }}>
+                  {Math.round(canvasZoom * 100)}%
+                </span>
+              </div>
+
+              {/* Image count */}
+              <div style={{
+                position: "absolute", bottom: 12, left: 12,
+                fontSize: 10, color: S.dim, padding: "5px 8px",
+                background: S.panel, borderRadius: 6, border: `1px solid ${S.border}`, zIndex: 10,
+              }}>
+                {images.length} image{images.length !== 1 ? "s" : ""}
+                {selectedImageId && ` · ${images.find(i => i.id === selectedImageId)?.name || ""}`}
+              </div>
+            </>
           )}
         </div>
 
         {/* ── PARAMETER BOTTOM PANEL ── */}
-        {image && shader && (
+        {selectedImageId && image && shader && (
           <div style={{ borderTop: `1px solid ${S.border}`, background: S.panel, padding: "10px 20px", flexShrink: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 20, overflowX: "auto" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
