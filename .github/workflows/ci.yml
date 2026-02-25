@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & Verify
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Check dist output
+        run: |
+          test -f dist/index.html && echo "✅ index.html exists" || exit 1
+          test -d dist/assets && echo "✅ assets directory exists" || exit 1
+          echo "📦 Build size:"
+          du -sh dist/
+          echo "📄 Files:"
+          find dist -type f | head -20
