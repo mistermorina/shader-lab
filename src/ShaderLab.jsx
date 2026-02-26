@@ -623,7 +623,8 @@ export default function ShaderLabV2() {
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 });
   // ── Infinite Canvas ──
   const [images, setImages] = useState([]);
-  const [selectedImageId, setSelectedImageId] = useState(null);
+  const [selectedImageIds, setSelectedImageIds] = useState(new Set());
+  const [primarySelectedId, setPrimarySelectedId] = useState(null);
   const [canvasPan, setCanvasPan] = useState({ x: 0, y: 0 });
   const [canvasZoom, setCanvasZoom] = useState(1);
   const [isPanning, setIsPanning] = useState(false);
@@ -799,17 +800,17 @@ export default function ShaderLabV2() {
 
   // ── Snapshot processed image back to grid ──
   useEffect(() => {
-    if (!selectedImageId || !image || !canvasRef.current) return;
+    if (!primarySelectedId || !image || !canvasRef.current) return;
     const hasAnimated = effectStack.some(e => e.enabled && SHADERS[e.shaderKey]?.animated);
     if (hasAnimated) return;
     const timer = setTimeout(() => {
       try {
         const dataUrl = canvasRef.current?.toDataURL("image/png");
-        if (dataUrl) setImages(prev => prev.map(img => img.id === selectedImageId ? { ...img, processedSrc: dataUrl } : img));
+        if (dataUrl) setImages(prev => prev.map(img => img.id === primarySelectedId ? { ...img, processedSrc: dataUrl } : img));
       } catch (e) { /* ignore */ }
     }, 150);
     return () => clearTimeout(timer);
-  }, [selectedImageId, effectStack, image, activeFormat]);
+  }, [primarySelectedId, effectStack, image, activeFormat]);
 
   // ── Image loading ──
   const handleImageLoad = (file) => {
@@ -828,7 +829,8 @@ export default function ShaderLabV2() {
             name: file.name,
           };
           setImages(prev => [...prev, entry]);
-          setSelectedImageId(newId);
+          setPrimarySelectedId(newId);
+          setSelectedImageIds(new Set([newId]));
           setImage(finalImg);
           setImageSrc(finalSrc);
         };
@@ -898,35 +900,147 @@ export default function ShaderLabV2() {
     setEffectStack(prev => prev.map((e, i) => i === selectedEffectIdx ? { ...e, params: {} } : e));
   };
 
-  // ── Image Selection ──
-  const handleSelectImage = useCallback((id) => {
-    if (id === selectedImageId) return;
-    if (selectedImageId && canvasRef.current && image) {
-      try {
-        const dataUrl = canvasRef.current.toDataURL("image/png");
-        setImages(prev => prev.map(img => img.id === selectedImageId ? { ...img, processedSrc: dataUrl } : img));
-      } catch (e) { /* ignore */ }
+  // ── Image Selection (supports multi-select with Shift/Cmd) ──
+  const handleSelectImage = useCallback((id, event) => {
+    // Multi-select with Shift or Cmd/Ctrl
+    if (event?.shiftKey || event?.metaKey || event?.ctrlKey) {
+      setSelectedImageIds(prev => {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id); else next.add(id);
+        return next;
+      });
+    } else {
+      // Normal click: single select
+      setSelectedImageIds(new Set([id]));
     }
-    const found = images.find(i => i.id === id);
-    if (found) {
-      setSelectedImageId(id);
-      setImage(found.img);
-      setImageSrc(found.src);
+
+    // Update primary for WebGL preview
+    if (id !== primarySelectedId) {
+      if (primarySelectedId && canvasRef.current && image) {
+        try {
+          const dataUrl = canvasRef.current.toDataURL("image/png");
+          setImages(prev => prev.map(img => img.id === primarySelectedId ? { ...img, processedSrc: dataUrl } : img));
+        } catch (e) { /* ignore */ }
+      }
+      const found = images.find(i => i.id === id);
+      if (found) {
+        setPrimarySelectedId(id);
+        setImage(found.img);
+        setImageSrc(found.src);
+      }
     }
-  }, [selectedImageId, images, image]);
+  }, [primarySelectedId, images, image]);
 
   const handleRemoveImage = useCallback((id) => {
     setImages(prev => prev.filter(i => i.id !== id));
-    if (selectedImageId === id) {
-      setSelectedImageId(null);
+    setSelectedImageIds(prev => { const next = new Set(prev); next.delete(id); return next; });
+    if (primarySelectedId === id) {
+      setPrimarySelectedId(null);
       setImage(null);
       setImageSrc(null);
     }
-  }, [selectedImageId]);
+  }, [primarySelectedId]);
 
   const clearAllImages = () => {
-    setImages([]); setSelectedImageId(null); setImage(null); setImageSrc(null);
+    setImages([]); setPrimarySelectedId(null); setSelectedImageIds(new Set()); setImage(null); setImageSrc(null);
   };
+
+  // ── Apply effects to all selected images ──
+  const [applyingToAll, setApplyingToAll] = useState(false);
+  const applyToAllSelected = useCallback(async () => {
+    const targets = images.filter(img => selectedImageIds.has(img.id) && img.id !== primarySelectedId);
+    if (targets.length === 0) return;
+    const enabledEffects = effectStack.filter(e => e.enabled);
+    if (enabledEffects.length === 0) return;
+    setApplyingToAll(true);
+    try {
+      const offCanvas = document.createElement("canvas");
+      const gl2 = offCanvas.getContext("webgl", { preserveDrawingBuffer: true });
+      if (!gl2) return;
+      // Compile programs
+      const programs = {};
+      for (const eff of enabledEffects) {
+        const sd = SHADERS[eff.shaderKey]; if (!sd) continue;
+        const vs = gl2.createShader(gl2.VERTEX_SHADER);
+        gl2.shaderSource(vs, `attribute vec2 a_position;attribute vec2 a_texCoord;varying vec2 v_texCoord;void main(){gl_Position=vec4(a_position,0,1);v_texCoord=a_texCoord;}`);
+        gl2.compileShader(vs);
+        const fs = gl2.createShader(gl2.FRAGMENT_SHADER);
+        gl2.shaderSource(fs, wrapFragment(sd.fragment));
+        gl2.compileShader(fs);
+        const prog = gl2.createProgram();
+        gl2.attachShader(prog, vs); gl2.attachShader(prog, fs); gl2.linkProgram(prog);
+        if (gl2.getProgramParameter(prog, gl2.LINK_STATUS)) programs[eff.shaderKey] = prog;
+      }
+      const posBuf = gl2.createBuffer();
+      gl2.bindBuffer(gl2.ARRAY_BUFFER, posBuf);
+      gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl2.STATIC_DRAW);
+      const tcBuf = gl2.createBuffer();
+      gl2.bindBuffer(gl2.ARRAY_BUFFER, tcBuf);
+      gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([0,0,1,0,0,1,1,1]), gl2.STATIC_DRAW);
+
+      for (const target of targets) {
+        const img = new Image(); img.src = target.src;
+        await new Promise(r => { img.onload = r; if (img.complete) r(); });
+        const maxDim = 1200;
+        let w = img.width, h = img.height;
+        if (w > maxDim || h > maxDim) { const sc = maxDim / Math.max(w, h); w = Math.round(w * sc); h = Math.round(h * sc); }
+        offCanvas.width = w; offCanvas.height = h;
+        gl2.viewport(0, 0, w, h);
+        const tex = gl2.createTexture();
+        gl2.bindTexture(gl2.TEXTURE_2D, tex);
+        gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_WRAP_S, gl2.CLAMP_TO_EDGE);
+        gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_WRAP_T, gl2.CLAMP_TO_EDGE);
+        gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_MIN_FILTER, gl2.LINEAR);
+        gl2.texImage2D(gl2.TEXTURE_2D, 0, gl2.RGBA, gl2.RGBA, gl2.UNSIGNED_BYTE, img);
+        // Create FBOs
+        const createFBO = () => {
+          const fb = gl2.createFramebuffer(); const t = gl2.createTexture();
+          gl2.bindTexture(gl2.TEXTURE_2D, t);
+          gl2.texImage2D(gl2.TEXTURE_2D, 0, gl2.RGBA, w, h, 0, gl2.RGBA, gl2.UNSIGNED_BYTE, null);
+          gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_MIN_FILTER, gl2.LINEAR);
+          gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_WRAP_S, gl2.CLAMP_TO_EDGE);
+          gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_WRAP_T, gl2.CLAMP_TO_EDGE);
+          gl2.bindFramebuffer(gl2.FRAMEBUFFER, fb);
+          gl2.framebufferTexture2D(gl2.FRAMEBUFFER, gl2.COLOR_ATTACHMENT0, gl2.TEXTURE_2D, t, 0);
+          return { framebuffer: fb, texture: t };
+        };
+        const fboA = createFBO(), fboB = createFBO();
+        let readTex = tex;
+        for (let i = 0; i < enabledEffects.length; i++) {
+          const eff = enabledEffects[i];
+          const sd = SHADERS[eff.shaderKey]; const prog = programs[eff.shaderKey]; if (!prog) continue;
+          const isLast = i === enabledEffects.length - 1;
+          gl2.bindFramebuffer(gl2.FRAMEBUFFER, enabledEffects.length === 1 ? null : (isLast ? null : [fboA, fboB][i % 2].framebuffer));
+          gl2.useProgram(prog);
+          const ap = gl2.getAttribLocation(prog, "a_position");
+          gl2.bindBuffer(gl2.ARRAY_BUFFER, posBuf); gl2.enableVertexAttribArray(ap); gl2.vertexAttribPointer(ap, 2, gl2.FLOAT, false, 0, 0);
+          const at = gl2.getAttribLocation(prog, "a_texCoord");
+          gl2.bindBuffer(gl2.ARRAY_BUFFER, tcBuf); gl2.enableVertexAttribArray(at); gl2.vertexAttribPointer(at, 2, gl2.FLOAT, false, 0, 0);
+          gl2.activeTexture(gl2.TEXTURE0); gl2.bindTexture(gl2.TEXTURE_2D, readTex);
+          gl2.uniform1i(gl2.getUniformLocation(prog, "u_image"), 0);
+          gl2.uniform2f(gl2.getUniformLocation(prog, "u_resolution"), w, h);
+          const tl = gl2.getUniformLocation(prog, "u_time"); if (tl) gl2.uniform1f(tl, 0);
+          const ml = gl2.getUniformLocation(prog, "u_mixIntensity"); if (ml) gl2.uniform1f(ml, eff.intensity);
+          Object.keys(sd.uniforms).forEach(k => {
+            const v = eff.params[k] !== undefined ? eff.params[k] : sd.uniforms[k].default;
+            gl2.uniform1f(gl2.getUniformLocation(prog, k), v);
+          });
+          gl2.drawArrays(gl2.TRIANGLE_STRIP, 0, 4);
+          if (!isLast) readTex = [fboA, fboB][i % 2].texture;
+        }
+        const dataUrl = offCanvas.toDataURL("image/png");
+        setImages(prev => prev.map(img => img.id === target.id ? { ...img, processedSrc: dataUrl } : img));
+        // Cleanup textures/fbos for this image
+        gl2.deleteTexture(tex);
+        gl2.deleteTexture(fboA.texture); gl2.deleteFramebuffer(fboA.framebuffer);
+        gl2.deleteTexture(fboB.texture); gl2.deleteFramebuffer(fboB.framebuffer);
+      }
+      // Cleanup programs
+      Object.values(programs).forEach(p => gl2.deleteProgram(p));
+      gl2.getExtension("WEBGL_lose_context")?.loseContext();
+    } catch (e) { console.error("Apply to all failed:", e); }
+    setApplyingToAll(false);
+  }, [images, selectedImageIds, primarySelectedId, effectStack]);
 
   // ── Infinite Canvas: Grid Layout ──
   const GRID_COL_W = 300;
@@ -1285,7 +1399,7 @@ export default function ShaderLabV2() {
   };
 
   return (
-    <div style={{ minHeight: "100vh", background: S.bg, color: S.text, fontFamily: "'JetBrains Mono','SF Mono',monospace", display: "flex", flexDirection: "column" }}>
+    <div style={{ height: "100vh", overflow: "hidden", background: S.bg, color: S.text, fontFamily: "'JetBrains Mono','SF Mono',monospace", display: "flex", flexDirection: "column" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap');
         *{box-sizing:border-box;margin:0;padding:0}
@@ -1370,40 +1484,47 @@ export default function ShaderLabV2() {
             {/* ── Effects Tab ── */}
             {tab === "effects" && (
               <>
+                <p style={{ fontSize: 8, color: S.dim, marginBottom: 10, letterSpacing: ".06em" }}>
+                  CLICK TO ADD · SWAP TO REPLACE SELECTED
+                </p>
                 {Object.entries(grouped).map(([cat, shaders]) => (
                   <div key={cat} style={{ marginBottom: 14 }}>
                     <p style={{ fontSize: 9, color: S.dim, letterSpacing: ".12em", marginBottom: 8, textTransform: "uppercase" }}>
                       {CATEGORIES[cat]}
                     </p>
-                    {shaders.map(s => (
+                    {shaders.map(s => {
+                      const inStack = effectStack.some(e => e.shaderKey === s.key);
+                      return (
                       <div key={s.key} style={{ display: "flex", alignItems: "stretch", gap: 2, marginBottom: 2 }}>
-                        <button onClick={() => {
-                          setEffectStack(prev => prev.map((e, i) =>
-                            i === selectedEffectIdx ? { ...e, shaderKey: s.key, params: {} } : e
-                          ));
-                        }} style={{
+                        <button onClick={() => addToStack(s.key)} style={{
                           display: "block", flex: 1, padding: "8px 10px",
-                          background: activeShader === s.key ? S.subtle : "transparent",
-                          border: activeShader === s.key ? `1px solid ${S.border}` : "1px solid transparent",
-                          borderRadius: 6, color: activeShader === s.key ? "#fff" : S.muted,
+                          background: inStack ? S.subtle : "transparent",
+                          border: inStack ? `1px solid ${S.border}` : "1px solid transparent",
+                          borderRadius: 6, color: inStack ? "#fff" : S.muted,
                           fontSize: 12, fontFamily: "'Space Grotesk',sans-serif",
-                          fontWeight: activeShader === s.key ? 500 : 400, textAlign: "left", cursor: "pointer", transition: "all .12s",
+                          fontWeight: inStack ? 500 : 400, textAlign: "left", cursor: "pointer", transition: "all .12s",
                         }}>
                           <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
                             {s.label}
                             {s.animated && <span style={{ fontSize: 7, padding: "1px 4px", background: "rgba(139,92,246,.15)", color: S.accent, borderRadius: 3, fontFamily: "inherit" }}>ANIM</span>}
+                            {inStack && <span style={{ fontSize: 7, padding: "1px 4px", background: "rgba(139,92,246,.25)", color: S.accent, borderRadius: 3, fontFamily: "inherit" }}>IN STACK</span>}
                           </span>
                           <span style={{ display: "block", fontSize: 9, color: S.dim, marginTop: 1 }}>{s.desc}</span>
                         </button>
-                        <button onClick={() => addToStack(s.key)}
-                          title="Add to stack"
+                        <button onClick={() => {
+                          setEffectStack(prev => prev.map((e, i) =>
+                            i === selectedEffectIdx ? { ...e, shaderKey: s.key, params: {} } : e
+                          ));
+                        }}
+                          title="Replace selected effect"
                           style={{
                             background: "transparent", border: `1px solid ${S.border}`, borderRadius: 6,
-                            color: S.dim, fontSize: 11, cursor: "pointer", padding: "0 6px", flexShrink: 0,
-                            transition: "all .12s",
-                          }}>+</button>
+                            color: S.dim, fontSize: 8, cursor: "pointer", padding: "0 8px", flexShrink: 0,
+                            transition: "all .12s", letterSpacing: ".04em", fontFamily: "'Space Grotesk',sans-serif",
+                          }}>SWAP</button>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ))}
 
@@ -1603,16 +1724,19 @@ export default function ShaderLabV2() {
                 position: "absolute", top: 0, left: 0,
                 width: "100%", minHeight: "100%",
               }}>
-                {gridLayout.items.map(item => (
+                {gridLayout.items.map(item => {
+                  const isPrimary = item.id === primarySelectedId;
+                  const isSelected = selectedImageIds.has(item.id);
+                  return (
                   <div key={item.id} className="img-card"
                     onMouseDown={(e) => e.stopPropagation()}
-                    onClick={(e) => { e.stopPropagation(); handleSelectImage(item.id); }}
+                    onClick={(e) => { e.stopPropagation(); handleSelectImage(item.id, e); }}
                     style={{
                       position: "absolute", left: item.gx, top: item.gy,
                       width: item.gw, height: item.gh,
                       borderRadius: 8, overflow: "hidden",
-                      border: selectedImageId === item.id ? `2px solid ${S.accent}` : "2px solid transparent",
-                      boxShadow: selectedImageId === item.id ? `0 0 20px rgba(139,92,246,.3)` : "0 2px 12px rgba(0,0,0,.4)",
+                      border: isSelected ? `2px solid ${isPrimary ? S.accent : '#6d28d9'}` : "2px solid transparent",
+                      boxShadow: isSelected ? `0 0 20px rgba(139,92,246,${isPrimary ? '.3' : '.15'})` : "0 2px 12px rgba(0,0,0,.4)",
                       cursor: "pointer",
                       transition: "border-color 0.15s, box-shadow 0.15s",
                     }}>
@@ -1635,11 +1759,12 @@ export default function ShaderLabV2() {
                       pointerEvents: "none",
                     }}>{item.name}</div>
                   </div>
-                ))}
+                  );
+                })}
 
                 {/* WebGL canvas overlay for selected image */}
                 {(() => {
-                  const sel = selectedImageId ? gridLayout.items.find(i => i.id === selectedImageId) : null;
+                  const sel = primarySelectedId ? gridLayout.items.find(i => i.id === primarySelectedId) : null;
                   return (
                     <div style={{
                       position: "absolute",
@@ -1699,21 +1824,44 @@ export default function ShaderLabV2() {
                 </span>
               </div>
 
-              {/* Image count */}
+              {/* Image count + selection controls */}
               <div style={{
                 position: "absolute", bottom: 12, left: 12,
-                fontSize: 10, color: S.dim, padding: "5px 8px",
-                background: S.panel, borderRadius: 6, border: `1px solid ${S.border}`, zIndex: 10,
+                display: "flex", gap: 6, alignItems: "center", zIndex: 10,
               }}>
-                {images.length} image{images.length !== 1 ? "s" : ""}
-                {selectedImageId && ` · ${images.find(i => i.id === selectedImageId)?.name || ""}`}
+                <div style={{
+                  fontSize: 10, color: S.dim, padding: "5px 8px",
+                  background: S.panel, borderRadius: 6, border: `1px solid ${S.border}`,
+                }}>
+                  {images.length} image{images.length !== 1 ? "s" : ""}
+                  {selectedImageIds.size > 1 && ` · ${selectedImageIds.size} selected`}
+                  {selectedImageIds.size === 1 && primarySelectedId && ` · ${images.find(i => i.id === primarySelectedId)?.name || ""}`}
+                </div>
+                {images.length > 1 && (
+                  <button onClick={() => {
+                    if (selectedImageIds.size === images.length) {
+                      setSelectedImageIds(primarySelectedId ? new Set([primarySelectedId]) : new Set());
+                    } else {
+                      setSelectedImageIds(new Set(images.map(i => i.id)));
+                    }
+                  }}
+                    style={{
+                      fontSize: 9, color: selectedImageIds.size === images.length ? S.accent : S.dim,
+                      padding: "5px 8px", background: S.panel, borderRadius: 6,
+                      border: `1px solid ${selectedImageIds.size === images.length ? S.accent : S.border}`,
+                      cursor: "pointer", fontFamily: "inherit", letterSpacing: ".04em",
+                      transition: "all .15s",
+                    }}>
+                    {selectedImageIds.size === images.length ? "DESELECT" : "SELECT ALL"}
+                  </button>
+                )}
               </div>
             </>
           )}
         </div>
 
         {/* ── PARAMETER BOTTOM PANEL ── */}
-        {selectedImageId && image && shader && (
+        {primarySelectedId && image && shader && (
           <div style={{ borderTop: `1px solid ${S.border}`, background: S.panel, padding: "10px 20px", flexShrink: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 20, overflowX: "auto" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
@@ -1745,8 +1893,15 @@ export default function ShaderLabV2() {
                 );
               })}
               <button className="btn" onClick={savePreset} style={{ flexShrink: 0, background: "transparent", color: S.muted }}>
-                💾 SAVE PRESET
+                SAVE PRESET
               </button>
+              {selectedImageIds.size > 1 && (
+                <button className="btn-primary btn" onClick={applyToAllSelected}
+                  disabled={applyingToAll}
+                  style={{ flexShrink: 0, opacity: applyingToAll ? 0.6 : 1, cursor: applyingToAll ? "wait" : "pointer" }}>
+                  {applyingToAll ? "APPLYING..." : `APPLY TO ALL (${selectedImageIds.size})`}
+                </button>
+              )}
             </div>
           </div>
         )}
