@@ -1,4 +1,11 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import {
+  commitEditorHistory,
+  createEditorHistory,
+  redoEditorHistory,
+  replaceEditorPresent,
+  undoEditorHistory,
+} from "./editorHistory.js";
 
 /* ═══════════════════════════════════════════════════════════
    SHADER.LAB v2 — Full-featured WebGL image filter studio
@@ -42,7 +49,7 @@ class GIFEncoder {
     };
     const lzw = (is, mcs) => {
       const cc=1<<mcs, ei=cc+1; let cs=mcs+1, nc=ei+1;
-      const t=new Map(), o=[]; let cb=0,cy=0,bp=0;
+      const t=new Map(), o=[]; let cy=0,bp=0;
       const wbits=(c,s)=>{cy|=(c<<bp);bp+=s;while(bp>=8){o.push(cy&0xff);cy>>=8;bp-=8;}};
       const reset=()=>{t.clear();for(let i=0;i<cc;i++)t.set(String(i),i);nc=ei+1;cs=mcs+1;};
       reset(); wbits(cc,cs);
@@ -91,6 +98,17 @@ const FORMATS = {
 
 // ── VERTEX SHADER ──────────────────────────────────────────
 const VS = `attribute vec2 a_position;attribute vec2 a_texCoord;varying vec2 v_texCoord;void main(){gl_Position=vec4(a_position,0,1);v_texCoord=a_texCoord;}`;
+const QUAD_POSITIONS = [-1,-1,1,-1,-1,1,1,1];
+const SOURCE_TEX_COORDS = [0,1,1,1,0,0,1,0];
+const FRAMEBUFFER_TEX_COORDS = [0,0,1,0,0,1,1,1];
+const TEXT_FONTS = {
+  space: { label: "Space Grotesk", stack: "'Space Grotesk', system-ui, sans-serif" },
+  mono: { label: "JetBrains Mono", stack: "'JetBrains Mono', 'SF Mono', monospace" },
+  system: { label: "System Sans", stack: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif" },
+  serif: { label: "Editorial Serif", stack: "Georgia, 'Times New Roman', serif" },
+};
+const TEXT_OVERLAY_FRAGMENT = `precision highp float;uniform sampler2D u_image;uniform sampler2D u_overlay;varying vec2 v_texCoord;
+void main(){vec4 base=texture2D(u_image,v_texCoord);vec4 overlay=texture2D(u_overlay,vec2(v_texCoord.x,1.0-v_texCoord.y));gl_FragColor=mix(base,overlay,overlay.a);}`;
 
 // ── COMMON GLSL UTILS ──────────────────────────────────────
 const GLSL_UTILS = `
@@ -449,6 +467,27 @@ const SHADERS = {
       u_invert: { label: "Invert", min: 0, max: 1, step: 1, default: 0, labels: ["Normal", "Invert"] },
     },
   },
+  displacement: {
+    label: "Displacement Map", desc: "Luminance and noise driven distortion", cat: "style",
+    animated: false,
+    fragment: `precision highp float;uniform sampler2D u_image;uniform vec2 u_resolution;uniform float u_strength,u_scale,u_angle,u_noiseMix;varying vec2 v_texCoord;
+    ${GLSL_UTILS}
+    void main(){vec2 uv=v_texCoord;float a=u_angle*3.14159265/180.0;vec2 dir=vec2(cos(a),sin(a));
+      vec3 sampleCol=texture2D(u_image,uv).rgb;
+      float lum=dot(sampleCol,vec3(0.299,0.587,0.114));
+      float n=noise(uv*u_scale*10.0);
+      float map=mix(lum,n,u_noiseMix)-0.5;
+      vec2 offset=dir*map*u_strength*0.14;
+      vec2 cross=vec2(-dir.y,dir.x)*(n-0.5)*u_strength*0.035*u_noiseMix;
+      vec4 col=texture2D(u_image,clamp(uv+offset+cross,0.0,1.0));
+      gl_FragColor=vec4(col.rgb,1.0);}`,
+    uniforms: {
+      u_strength: { label: "Strength", min: 0, max: 0.18, step: 0.005, default: 0.055 },
+      u_scale: { label: "Scale", min: 0.3, max: 5, step: 0.1, default: 1.4 },
+      u_angle: { label: "Angle", min: -180, max: 180, step: 1, default: 0 },
+      u_noiseMix: { label: "Noise Mix", min: 0, max: 1, step: 0.01, default: 0.35 },
+    },
+  },
 };
 
 // ── PRESET DEFINITIONS ─────────────────────────────────────
@@ -472,6 +511,7 @@ const PRESETS = [
 
 // ── CATEGORIES ─────────────────────────────────────────────
 const CATEGORIES = { animate: "Animated", style: "Style", retro: "Retro" };
+const CUSTOM_PRESETS_STORAGE_KEY = "shader-lab.filters.custom-presets.v1";
 
 // ── FBO HELPER ────────────────────────────────────────────────
 function createFBO(gl, w, h) {
@@ -514,6 +554,107 @@ function wrapFragment(src) {
     + '\n    vec4 _orig = texture2D(u_image, v_texCoord);\n    gl_FragColor = mix(_orig, gl_FragColor, u_mixIntensity);\n}'
     + wrapped.slice(lastBrace + 1);
   return wrapped;
+}
+
+function compileProgram(gl, fragmentSource) {
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, VS);
+  gl.compileShader(vs);
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, fragmentSource);
+  gl.compileShader(fs);
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS) || !gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    const message = gl.getShaderInfoLog(vs) || gl.getShaderInfoLog(fs) || "Shader compile failed";
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    throw new Error(message);
+  }
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    const message = gl.getProgramInfoLog(program) || "Shader link failed";
+    gl.deleteProgram(program);
+    throw new Error(message);
+  }
+  return program;
+}
+
+function isTextOverlayActive(textOverlay) {
+  return textOverlay?.enabled === true && Boolean(textOverlay.text?.trim());
+}
+
+function scaledTextSize(textOverlay, width, height) {
+  const base = Math.min(width, height);
+  return Math.max(10, Math.round(textOverlay.fontSize * (base / 1080)));
+}
+
+function drawTextOverlayCanvas(textOverlay, width, height) {
+  const overlayCanvas = document.createElement("canvas");
+  overlayCanvas.width = width;
+  overlayCanvas.height = height;
+  const ctx = overlayCanvas.getContext("2d");
+  if (!ctx || !isTextOverlayActive(textOverlay)) return overlayCanvas;
+
+  const font = TEXT_FONTS[textOverlay.fontFamily] || TEXT_FONTS.space;
+  const size = scaledTextSize(textOverlay, width, height);
+  ctx.clearRect(0, 0, width, height);
+  ctx.save();
+  ctx.translate(textOverlay.x * width, textOverlay.y * height);
+  ctx.rotate((textOverlay.rotation * Math.PI) / 180);
+  ctx.globalAlpha = textOverlay.opacity;
+  ctx.fillStyle = textOverlay.color;
+  ctx.textAlign = textOverlay.align;
+  ctx.textBaseline = "middle";
+  ctx.font = `700 ${size}px ${font.stack}`;
+  ctx.shadowColor = "rgba(0,0,0,0.42)";
+  ctx.shadowBlur = Math.max(2, Math.round(size * 0.08));
+  ctx.shadowOffsetY = Math.max(1, Math.round(size * 0.04));
+  ctx.fillText(textOverlay.text, 0, 0);
+  ctx.restore();
+  return overlayCanvas;
+}
+
+function createTextOverlayTexture(gl, textOverlay, width, height) {
+  const overlayCanvas = drawTextOverlayCanvas(textOverlay, width, height);
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, overlayCanvas);
+  return tex;
+}
+
+function drawTextOverlayWebGL({ gl, program, posBuffer, texBuffer, baseTexture, textOverlay, width, height }) {
+  if (!baseTexture || !isTextOverlayActive(textOverlay)) return program;
+  const overlayProgram = program || compileProgram(gl, TEXT_OVERLAY_FRAGMENT);
+  const overlayTexture = createTextOverlayTexture(gl, textOverlay, width, height);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, width, height);
+  gl.useProgram(overlayProgram);
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+  const positionLocation = gl.getAttribLocation(overlayProgram, "a_position");
+  gl.enableVertexAttribArray(positionLocation);
+  gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
+  const texLocation = gl.getAttribLocation(overlayProgram, "a_texCoord");
+  gl.enableVertexAttribArray(texLocation);
+  gl.vertexAttribPointer(texLocation, 2, gl.FLOAT, false, 0, 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, baseTexture);
+  gl.uniform1i(gl.getUniformLocation(overlayProgram, "u_image"), 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, overlayTexture);
+  gl.uniform1i(gl.getUniformLocation(overlayProgram, "u_overlay"), 1);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.deleteTexture(overlayTexture);
+  gl.activeTexture(gl.TEXTURE0);
+  return overlayProgram;
 }
 
 // ── Minimal ZIP creator (no library needed) ──────────────────
@@ -597,32 +738,72 @@ async function createZIP(entries) {
   return new Blob(parts, { type: "application/zip" });
 }
 
+function safeFilePart(value) {
+  return String(value || "export")
+    .toLowerCase()
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    || "export";
+}
+
+function triggerDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.download = filename;
+  link.href = url;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function canvasToBlob(canvas, type = "image/png", quality) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error(`Could not encode ${type}.`));
+    }, type, quality);
+  });
+}
+
+function createEffectEntry(shaderKey = "wobble", params = {}) {
+  return {
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    shaderKey,
+    params: { ...params },
+    intensity: 1,
+    enabled: true,
+  };
+}
+
 // ══════════════════════ MAIN COMPONENT ═════════════════════
-export default function FiltersWorkspace({
-  hidden = false,
-  workspaceMode = "filters",
-  setWorkspaceMode = () => {},
-}) {
+export default function FiltersWorkspace() {
   const [image, setImage] = useState(null);
-  const [imageSrc, setImageSrc] = useState(null);
-  const [effectStack, setEffectStack] = useState([
-    { id: Date.now().toString(36) + "0", shaderKey: "wobble", params: {}, intensity: 1.0, enabled: true }
-  ]);
-  const [selectedEffectIdx, setSelectedEffectIdx] = useState(0);
+  const [editorHistory, setEditorHistory] = useState(() => createEditorHistory({
+    effectStack: [createEffectEntry("wobble")],
+    selectedEffectIdx: 0,
+    activeFormat: "free",
+  }));
   const [isDragging, setIsDragging] = useState(false);
   const [compareMode, setCompareMode] = useState(false);
   const [comparePos, setComparePos] = useState(0.5);
   const [draggingCompare, setDraggingCompare] = useState(false);
-  const [activeFormat, setActiveFormat] = useState("free");
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
-  const [showPresets, setShowPresets] = useState(false);
-  const [customPresets, setCustomPresets] = useState([]);
+  const [customPresets, setCustomPresets] = useState(() => {
+    try {
+      const raw = localStorage.getItem(CUSTOM_PRESETS_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
   const [recording, setRecording] = useState(false);
   const [recordProgress, setRecordProgress] = useState(0);
   const [recordSec, setRecordSec] = useState(3);
-  const [tab, setTab] = useState("effects"); // effects | format | presets | batch
-  const [batchMode, setBatchMode] = useState(false);
+  const [renderError, setRenderError] = useState("");
+  const [tab, setTab] = useState("effects"); // effects | format | text | presets | batch
+  const [effectSearch, setEffectSearch] = useState("");
   const [batchQueue, setBatchQueue] = useState([]);
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0 });
   // ── Infinite Canvas ──
@@ -639,9 +820,11 @@ export default function FiltersWorkspace({
   const fileInputRef = useRef(null);
   const glRef = useRef(null);
   const programCacheRef = useRef({});
+  const textOverlayProgramRef = useRef(null);
   const fboRef = useRef({ a: null, b: null });
   const posBufRef = useRef(null);
-  const texBufRef = useRef(null);
+  const sourceTexBufRef = useRef(null);
+  const framebufferTexBufRef = useRef(null);
   const batchFileInputRef = useRef(null);
   const textureRef = useRef(null);
   const animFrameRef = useRef(null);
@@ -650,19 +833,98 @@ export default function FiltersWorkspace({
   const compareAreaRef = useRef(null);
   const infiniteCanvasRef = useRef(null);
   const panStartRef = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
+  const recordProgressIntervalRef = useRef(null);
+  const recordStreamRef = useRef(null);
 
+  const { effectStack, selectedEffectIdx, activeFormat, textOverlay } = editorHistory.present;
+  const canUndo = editorHistory.past.length > 0;
+  const canRedo = editorHistory.future.length > 0;
   const activeEffect = effectStack[selectedEffectIdx] || effectStack[0];
   const activeShader = activeEffect?.shaderKey ?? "wobble";
   const params = activeEffect?.params ?? {};
   const shader = SHADERS[activeShader];
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(CUSTOM_PRESETS_STORAGE_KEY, JSON.stringify(customPresets.slice(0, 24)));
+    } catch {
+      // Presets are a convenience layer; storage failures should not block editing.
+    }
+  }, [customPresets]);
+
+  const commitEditorState = useCallback((updater) => {
+    setEditorHistory(prev => commitEditorHistory(prev, updater));
+  }, []);
+
+  const replaceEditorState = useCallback((updater) => {
+    setEditorHistory(prev => replaceEditorPresent(prev, updater));
+  }, []);
+
+  const undoEditor = useCallback(() => {
+    setEditorHistory(prev => undoEditorHistory(prev));
+  }, []);
+
+  const redoEditor = useCallback(() => {
+    setEditorHistory(prev => redoEditorHistory(prev));
+  }, []);
+
+  const selectEffectIdx = useCallback((updater) => {
+    replaceEditorState(current => ({
+      ...current,
+      selectedEffectIdx: typeof updater === "function" ? updater(current.selectedEffectIdx) : updater,
+    }));
+  }, [replaceEditorState]);
+
+  useEffect(() => {
+    const isEditableTarget = (target) => {
+      if (!(target instanceof HTMLElement)) return false;
+      const tagName = target.tagName.toLowerCase();
+      return target.isContentEditable || tagName === "input" || tagName === "textarea" || tagName === "select";
+    };
+
+    const handleKeyDown = (event) => {
+      const key = event.key.toLowerCase();
+      if (isEditableTarget(event.target)) return;
+
+      if ((event.metaKey || event.ctrlKey) && key === "z") {
+        setEditorHistory(prev => {
+          const next = event.shiftKey ? redoEditorHistory(prev) : undoEditorHistory(prev);
+          if (next !== prev) event.preventDefault();
+          return next;
+        });
+      } else if (event.ctrlKey && key === "y") {
+        setEditorHistory(prev => {
+          const next = redoEditorHistory(prev);
+          if (next !== prev) event.preventDefault();
+          return next;
+        });
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
 
   // ── WebGL Setup ──
   const setupGL = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !image) return null;
     let gl = glRef.current;
-    if (gl && gl.canvas !== canvas) { gl = null; glRef.current = null; programCacheRef.current = {}; }
-    if (!gl) { gl = canvas.getContext("webgl", { preserveDrawingBuffer: true }); if (!gl) return null; glRef.current = gl; }
+    if (gl && gl.canvas !== canvas) {
+      gl = null;
+      glRef.current = null;
+      programCacheRef.current = {};
+      textOverlayProgramRef.current = null;
+    }
+    if (!gl) {
+      gl = canvas.getContext("webgl", { preserveDrawingBuffer: true });
+      if (!gl) {
+        setRenderError("WebGL is unavailable in this browser or context.");
+        return null;
+      }
+      glRef.current = gl;
+    }
+    setRenderError("");
 
     // Canvas sizing
     const fmt = FORMATS[activeFormat];
@@ -678,18 +940,41 @@ export default function FiltersWorkspace({
         const vs = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(vs, VS); gl.compileShader(vs);
         const fs = gl.createShader(gl.FRAGMENT_SHADER);
         gl.shaderSource(fs, wrapFragment(sd.fragment)); gl.compileShader(fs);
-        if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(fs)); continue; }
+        if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+          const message = `Vertex shader failed for ${sd.label}.`;
+          setRenderError(message);
+          console.error(`${message}`, gl.getShaderInfoLog(vs));
+          gl.deleteShader(vs); gl.deleteShader(fs);
+          continue;
+        }
+        if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+          const message = `Fragment shader failed for ${sd.label}.`;
+          setRenderError(message);
+          console.error(`${message}`, gl.getShaderInfoLog(fs));
+          gl.deleteShader(vs); gl.deleteShader(fs);
+          continue;
+        }
         const prog = gl.createProgram(); gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+        if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+          const message = `Shader program failed for ${sd.label}.`;
+          setRenderError(message);
+          console.error(`${message}`, gl.getProgramInfoLog(prog));
+          gl.deleteProgram(prog); gl.deleteShader(vs); gl.deleteShader(fs);
+          continue;
+        }
         programCacheRef.current[eff.shaderKey] = prog;
+        gl.deleteShader(vs); gl.deleteShader(fs);
       }
     }
 
     // Geometry buffers (once)
     if (!posBufRef.current) {
       posBufRef.current = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, posBufRef.current);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
-      texBufRef.current = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, texBufRef.current);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,1,1,1,0,0,1,0]), gl.STATIC_DRAW);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(QUAD_POSITIONS), gl.STATIC_DRAW);
+      sourceTexBufRef.current = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, sourceTexBufRef.current);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(SOURCE_TEX_COORDS), gl.STATIC_DRAW);
+      framebufferTexBufRef.current = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, framebufferTexBufRef.current);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(FRAMEBUFFER_TEX_COORDS), gl.STATIC_DRAW);
     }
 
     // Source image texture
@@ -718,36 +1003,53 @@ export default function FiltersWorkspace({
     if (!canvas || !gl || !image) return;
 
     const enabledEffects = effectStack.filter(e => e.enabled);
-    if (enabledEffects.length === 0) return;
+    const needsTextOverlay = isTextOverlayActive(textOverlay);
+    if (enabledEffects.length === 0 && !needsTextOverlay) return;
 
-    const bindAttrs = (prog) => {
+    const bindAttrs = (prog, texBuffer) => {
       gl.bindBuffer(gl.ARRAY_BUFFER, posBufRef.current);
       const pl = gl.getAttribLocation(prog, "a_position");
       gl.enableVertexAttribArray(pl); gl.vertexAttribPointer(pl, 2, gl.FLOAT, false, 0, 0);
-      gl.bindBuffer(gl.ARRAY_BUFFER, texBufRef.current);
+      gl.bindBuffer(gl.ARRAY_BUFFER, texBuffer);
       const tl = gl.getAttribLocation(prog, "a_texCoord");
       gl.enableVertexAttribArray(tl); gl.vertexAttribPointer(tl, 2, gl.FLOAT, false, 0, 0);
     };
 
+    const drawTextOverlayPass = (baseTexture, texBuffer) => {
+      if (!baseTexture || !needsTextOverlay) return;
+      textOverlayProgramRef.current = drawTextOverlayWebGL({
+        gl,
+        program: textOverlayProgramRef.current,
+        posBuffer: posBufRef.current,
+        texBuffer,
+        baseTexture,
+        textOverlay,
+        width: canvas.width,
+        height: canvas.height,
+      });
+    };
+
     const fbos = [fboRef.current.a, fboRef.current.b];
     let readTex = textureRef.current;
+    let readTexBuffer = sourceTexBufRef.current;
 
     for (let i = 0; i < enabledEffects.length; i++) {
       const eff = enabledEffects[i];
       const sd = SHADERS[eff.shaderKey]; if (!sd) continue;
       const prog = programCacheRef.current[eff.shaderKey]; if (!prog) continue;
       const isLast = i === enabledEffects.length - 1;
+      const renderToCanvas = isLast && !needsTextOverlay;
 
       // Single effect: render directly to canvas
-      if (enabledEffects.length === 1) {
+      if (enabledEffects.length === 1 && renderToCanvas) {
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       } else {
-        gl.bindFramebuffer(gl.FRAMEBUFFER, isLast ? null : fbos[i % 2].framebuffer);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, renderToCanvas ? null : fbos[i % 2].framebuffer);
       }
 
       gl.viewport(0, 0, canvas.width, canvas.height);
       gl.useProgram(prog);
-      bindAttrs(prog);
+      bindAttrs(prog, i === 0 ? sourceTexBufRef.current : framebufferTexBufRef.current);
 
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, readTex);
@@ -763,11 +1065,16 @@ export default function FiltersWorkspace({
 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
-      if (!isLast && enabledEffects.length > 1) {
+      if (!renderToCanvas) {
         readTex = fbos[i % 2].texture;
+        readTexBuffer = framebufferTexBufRef.current;
       }
     }
-  }, [effectStack, image]);
+
+    if (needsTextOverlay) {
+      drawTextOverlayPass(readTex, readTexBuffer);
+    }
+  }, [effectStack, image, textOverlay]);
 
   // ── Draw original for compare ──
   useEffect(() => {
@@ -786,7 +1093,6 @@ export default function FiltersWorkspace({
 
   // ── Animation loop ──
   useEffect(() => {
-    if (hidden) return undefined;
     if (!image) return;
     const gl = setupGL(); if (!gl) return;
     const hasAnimated = effectStack.some(e => e.enabled && SHADERS[e.shaderKey]?.animated);
@@ -801,7 +1107,7 @@ export default function FiltersWorkspace({
       animFrameRef.current = requestAnimationFrame(anim);
       return () => { if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current); };
     } else { renderFrame(0); }
-  }, [hidden, image, effectStack, setupGL, renderFrame, activeFormat]);
+  }, [image, effectStack, setupGL, renderFrame, activeFormat]);
 
   // ── Snapshot processed image back to grid ──
   useEffect(() => {
@@ -812,10 +1118,10 @@ export default function FiltersWorkspace({
       try {
         const dataUrl = canvasRef.current?.toDataURL("image/png");
         if (dataUrl) setImages(prev => prev.map(img => img.id === primarySelectedId ? { ...img, processedSrc: dataUrl } : img));
-      } catch (e) { /* ignore */ }
+      } catch { /* ignore */ }
     }, 150);
     return () => clearTimeout(timer);
-  }, [primarySelectedId, effectStack, image, activeFormat]);
+  }, [primarySelectedId, effectStack, image, activeFormat, textOverlay]);
 
   // ── Image loading ──
   const handleImageLoad = (file) => {
@@ -837,7 +1143,6 @@ export default function FiltersWorkspace({
           setPrimarySelectedId(newId);
           setSelectedImageIds(new Set([newId]));
           setImage(finalImg);
-          setImageSrc(finalSrc);
         };
         if (img.width > mx || img.height > mx) {
           const sc = mx / Math.max(img.width, img.height);
@@ -860,49 +1165,78 @@ export default function FiltersWorkspace({
   // ── Effect Stack ──
   const addToStack = (shaderKey) => {
     if (effectStack.length >= 8) return;
-    const newStack = [...effectStack, {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      shaderKey, params: {}, intensity: 1.0, enabled: true
-    }];
-    setEffectStack(newStack);
-    setSelectedEffectIdx(newStack.length - 1);
+    commitEditorState(current => {
+      const newStack = [...current.effectStack, createEffectEntry(shaderKey)];
+      return { ...current, effectStack: newStack, selectedEffectIdx: newStack.length - 1 };
+    });
   };
 
   const removeFromStack = (idx) => {
     if (effectStack.length <= 1) return;
-    setEffectStack(prev => prev.filter((_, i) => i !== idx));
-    setSelectedEffectIdx(prev => Math.min(prev, effectStack.length - 2));
+    commitEditorState(current => {
+      const nextStack = current.effectStack.filter((_, i) => i !== idx);
+      return {
+        ...current,
+        effectStack: nextStack,
+        selectedEffectIdx: Math.min(current.selectedEffectIdx, nextStack.length - 1),
+      };
+    });
   };
 
   const moveInStack = (idx, dir) => {
     const newIdx = idx + dir;
     if (newIdx < 0 || newIdx >= effectStack.length) return;
-    setEffectStack(prev => {
-      const arr = [...prev];
+    commitEditorState(current => {
+      const arr = [...current.effectStack];
       [arr[idx], arr[newIdx]] = [arr[newIdx], arr[idx]];
-      return arr;
+      return { ...current, effectStack: arr, selectedEffectIdx: newIdx };
     });
-    setSelectedEffectIdx(newIdx);
   };
 
   const toggleEffect = (idx) => {
-    setEffectStack(prev => prev.map((e, i) => i === idx ? { ...e, enabled: !e.enabled } : e));
+    commitEditorState(current => ({
+      ...current,
+      effectStack: current.effectStack.map((e, i) => i === idx ? { ...e, enabled: !e.enabled } : e),
+    }));
   };
 
   const setEffectIntensity = (idx, intensity) => {
-    setEffectStack(prev => prev.map((e, i) => i === idx ? { ...e, intensity } : e));
+    commitEditorState(current => ({
+      ...current,
+      effectStack: current.effectStack.map((e, i) => i === idx ? { ...e, intensity } : e),
+    }));
   };
 
   const setParams = (updater) => {
-    setEffectStack(prev => prev.map((e, i) => {
-      if (i !== selectedEffectIdx) return e;
-      const newParams = typeof updater === 'function' ? updater(e.params) : updater;
-      return { ...e, params: newParams };
+    commitEditorState(current => ({
+      ...current,
+      effectStack: current.effectStack.map((e, i) => {
+        if (i !== current.selectedEffectIdx) return e;
+        const newParams = typeof updater === 'function' ? updater(e.params) : updater;
+        return { ...e, params: newParams };
+      }),
     }));
   };
 
   const resetParams = () => {
-    setEffectStack(prev => prev.map((e, i) => i === selectedEffectIdx ? { ...e, params: {} } : e));
+    commitEditorState(current => ({
+      ...current,
+      effectStack: current.effectStack.map((e, i) => i === current.selectedEffectIdx ? { ...e, params: {} } : e),
+    }));
+  };
+
+  const commitTextOverlayEnabled = (enabled) => {
+    commitEditorState(current => ({
+      ...current,
+      textOverlay: { ...current.textOverlay, enabled },
+    }));
+  };
+
+  const updateTextOverlay = (patch) => {
+    commitEditorState(current => ({
+      ...current,
+      textOverlay: { ...current.textOverlay, ...patch },
+    }));
   };
 
   // ── Image Selection (supports multi-select with Shift/Cmd) ──
@@ -925,13 +1259,12 @@ export default function FiltersWorkspace({
         try {
           const dataUrl = canvasRef.current.toDataURL("image/png");
           setImages(prev => prev.map(img => img.id === primarySelectedId ? { ...img, processedSrc: dataUrl } : img));
-        } catch (e) { /* ignore */ }
+        } catch { /* ignore */ }
       }
       const found = images.find(i => i.id === id);
       if (found) {
         setPrimarySelectedId(id);
         setImage(found.img);
-        setImageSrc(found.src);
       }
     }
   }, [primarySelectedId, images, image]);
@@ -942,12 +1275,11 @@ export default function FiltersWorkspace({
     if (primarySelectedId === id) {
       setPrimarySelectedId(null);
       setImage(null);
-      setImageSrc(null);
     }
   }, [primarySelectedId]);
 
   const clearAllImages = () => {
-    setImages([]); setPrimarySelectedId(null); setSelectedImageIds(new Set()); setImage(null); setImageSrc(null);
+    setImages([]); setPrimarySelectedId(null); setSelectedImageIds(new Set()); setImage(null);
   };
 
   // ── Apply effects to all selected images ──
@@ -956,7 +1288,7 @@ export default function FiltersWorkspace({
     const targets = images.filter(img => selectedImageIds.has(img.id) && img.id !== primarySelectedId);
     if (targets.length === 0) return;
     const enabledEffects = effectStack.filter(e => e.enabled);
-    if (enabledEffects.length === 0) return;
+    if (enabledEffects.length === 0 && !isTextOverlayActive(textOverlay)) return;
     setApplyingToAll(true);
     try {
       const offCanvas = document.createElement("canvas");
@@ -976,12 +1308,16 @@ export default function FiltersWorkspace({
         gl2.attachShader(prog, vs); gl2.attachShader(prog, fs); gl2.linkProgram(prog);
         if (gl2.getProgramParameter(prog, gl2.LINK_STATUS)) programs[eff.shaderKey] = prog;
       }
+      let overlayProgram = null;
       const posBuf = gl2.createBuffer();
       gl2.bindBuffer(gl2.ARRAY_BUFFER, posBuf);
-      gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl2.STATIC_DRAW);
-      const tcBuf = gl2.createBuffer();
-      gl2.bindBuffer(gl2.ARRAY_BUFFER, tcBuf);
-      gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([0,0,1,0,0,1,1,1]), gl2.STATIC_DRAW);
+      gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array(QUAD_POSITIONS), gl2.STATIC_DRAW);
+      const sourceTcBuf = gl2.createBuffer();
+      gl2.bindBuffer(gl2.ARRAY_BUFFER, sourceTcBuf);
+      gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array(SOURCE_TEX_COORDS), gl2.STATIC_DRAW);
+      const framebufferTcBuf = gl2.createBuffer();
+      gl2.bindBuffer(gl2.ARRAY_BUFFER, framebufferTcBuf);
+      gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array(FRAMEBUFFER_TEX_COORDS), gl2.STATIC_DRAW);
 
       for (const target of targets) {
         const img = new Image(); img.src = target.src;
@@ -1011,16 +1347,19 @@ export default function FiltersWorkspace({
         };
         const fboA = createFBO(), fboB = createFBO();
         let readTex = tex;
+        let readTexBuffer = sourceTcBuf;
+        const needsTextOverlay = isTextOverlayActive(textOverlay);
         for (let i = 0; i < enabledEffects.length; i++) {
           const eff = enabledEffects[i];
           const sd = SHADERS[eff.shaderKey]; const prog = programs[eff.shaderKey]; if (!prog) continue;
           const isLast = i === enabledEffects.length - 1;
-          gl2.bindFramebuffer(gl2.FRAMEBUFFER, enabledEffects.length === 1 ? null : (isLast ? null : [fboA, fboB][i % 2].framebuffer));
+          const renderToCanvas = isLast && !needsTextOverlay;
+          gl2.bindFramebuffer(gl2.FRAMEBUFFER, (enabledEffects.length === 1 && renderToCanvas) || renderToCanvas ? null : [fboA, fboB][i % 2].framebuffer);
           gl2.useProgram(prog);
           const ap = gl2.getAttribLocation(prog, "a_position");
           gl2.bindBuffer(gl2.ARRAY_BUFFER, posBuf); gl2.enableVertexAttribArray(ap); gl2.vertexAttribPointer(ap, 2, gl2.FLOAT, false, 0, 0);
           const at = gl2.getAttribLocation(prog, "a_texCoord");
-          gl2.bindBuffer(gl2.ARRAY_BUFFER, tcBuf); gl2.enableVertexAttribArray(at); gl2.vertexAttribPointer(at, 2, gl2.FLOAT, false, 0, 0);
+          gl2.bindBuffer(gl2.ARRAY_BUFFER, i === 0 ? sourceTcBuf : framebufferTcBuf); gl2.enableVertexAttribArray(at); gl2.vertexAttribPointer(at, 2, gl2.FLOAT, false, 0, 0);
           gl2.activeTexture(gl2.TEXTURE0); gl2.bindTexture(gl2.TEXTURE_2D, readTex);
           gl2.uniform1i(gl2.getUniformLocation(prog, "u_image"), 0);
           gl2.uniform2f(gl2.getUniformLocation(prog, "u_resolution"), w, h);
@@ -1031,7 +1370,22 @@ export default function FiltersWorkspace({
             gl2.uniform1f(gl2.getUniformLocation(prog, k), v);
           });
           gl2.drawArrays(gl2.TRIANGLE_STRIP, 0, 4);
-          if (!isLast) readTex = [fboA, fboB][i % 2].texture;
+          if (!renderToCanvas) {
+            readTex = [fboA, fboB][i % 2].texture;
+            readTexBuffer = framebufferTcBuf;
+          }
+        }
+        if (needsTextOverlay) {
+          overlayProgram = drawTextOverlayWebGL({
+            gl: gl2,
+            program: overlayProgram,
+            posBuffer: posBuf,
+            texBuffer: readTexBuffer,
+            baseTexture: readTex,
+            textOverlay,
+            width: w,
+            height: h,
+          });
         }
         const dataUrl = offCanvas.toDataURL("image/png");
         setImages(prev => prev.map(img => img.id === target.id ? { ...img, processedSrc: dataUrl } : img));
@@ -1042,10 +1396,11 @@ export default function FiltersWorkspace({
       }
       // Cleanup programs
       Object.values(programs).forEach(p => gl2.deleteProgram(p));
+      if (overlayProgram) gl2.deleteProgram(overlayProgram);
       gl2.getExtension("WEBGL_lose_context")?.loseContext();
     } catch (e) { console.error("Apply to all failed:", e); }
     setApplyingToAll(false);
-  }, [images, selectedImageIds, primarySelectedId, effectStack]);
+  }, [images, selectedImageIds, primarySelectedId, effectStack, textOverlay]);
 
   // ── Infinite Canvas: Grid Layout ──
   const GRID_COL_W = 300;
@@ -1147,12 +1502,16 @@ export default function FiltersWorkspace({
     if (!offGl) { alert("WebGL not available"); return; }
 
     const pb = offGl.createBuffer(); offGl.bindBuffer(offGl.ARRAY_BUFFER, pb);
-    offGl.bufferData(offGl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), offGl.STATIC_DRAW);
-    const tb2 = offGl.createBuffer(); offGl.bindBuffer(offGl.ARRAY_BUFFER, tb2);
-    offGl.bufferData(offGl.ARRAY_BUFFER, new Float32Array([0,1,1,1,0,0,1,0]), offGl.STATIC_DRAW);
+    offGl.bufferData(offGl.ARRAY_BUFFER, new Float32Array(QUAD_POSITIONS), offGl.STATIC_DRAW);
+    const sourceTb = offGl.createBuffer(); offGl.bindBuffer(offGl.ARRAY_BUFFER, sourceTb);
+    offGl.bufferData(offGl.ARRAY_BUFFER, new Float32Array(SOURCE_TEX_COORDS), offGl.STATIC_DRAW);
+    const framebufferTb = offGl.createBuffer(); offGl.bindBuffer(offGl.ARRAY_BUFFER, framebufferTb);
+    offGl.bufferData(offGl.ARRAY_BUFFER, new Float32Array(FRAMEBUFFER_TEX_COORDS), offGl.STATIC_DRAW);
 
     const enabledEffects = effectStack.filter(e => e.enabled);
+    const needsTextOverlay = isTextOverlayActive(textOverlay);
     const programs = {};
+    let overlayProgram = null;
     for (const eff of enabledEffects) {
       if (!programs[eff.shaderKey]) {
         const sd = SHADERS[eff.shaderKey]; if (!sd) continue;
@@ -1191,21 +1550,24 @@ export default function FiltersWorkspace({
         offGl.texParameteri(offGl.TEXTURE_2D, offGl.TEXTURE_MAG_FILTER, offGl.LINEAR);
         offGl.texImage2D(offGl.TEXTURE_2D, 0, offGl.RGBA, offGl.RGBA, offGl.UNSIGNED_BYTE, processImg);
 
-        const fboA2 = enabledEffects.length > 1 ? createFBO(offGl, offCanvas.width, offCanvas.height) : null;
-        const fboB2 = enabledEffects.length > 1 ? createFBO(offGl, offCanvas.width, offCanvas.height) : null;
+        const needsFbo = enabledEffects.length > 1 || needsTextOverlay;
+        const fboA2 = needsFbo ? createFBO(offGl, offCanvas.width, offCanvas.height) : null;
+        const fboB2 = needsFbo ? createFBO(offGl, offCanvas.width, offCanvas.height) : null;
 
         let readTex = tex;
+        let readTexBuffer = sourceTb;
         const fbos2 = [fboA2, fboB2];
         for (let j = 0; j < enabledEffects.length; j++) {
           const eff = enabledEffects[j];
           const sd = SHADERS[eff.shaderKey]; const prog = programs[eff.shaderKey]; if (!prog) continue;
           const isLast = j === enabledEffects.length - 1;
-          offGl.bindFramebuffer(offGl.FRAMEBUFFER, (enabledEffects.length === 1 || isLast) ? null : fbos2[j % 2].framebuffer);
+          const renderToCanvas = isLast && !needsTextOverlay;
+          offGl.bindFramebuffer(offGl.FRAMEBUFFER, renderToCanvas ? null : fbos2[j % 2].framebuffer);
           offGl.viewport(0, 0, offCanvas.width, offCanvas.height);
           offGl.useProgram(prog);
           offGl.bindBuffer(offGl.ARRAY_BUFFER, pb);
           const pl = offGl.getAttribLocation(prog, "a_position"); offGl.enableVertexAttribArray(pl); offGl.vertexAttribPointer(pl, 2, offGl.FLOAT, false, 0, 0);
-          offGl.bindBuffer(offGl.ARRAY_BUFFER, tb2);
+          offGl.bindBuffer(offGl.ARRAY_BUFFER, j === 0 ? sourceTb : framebufferTb);
           const tl = offGl.getAttribLocation(prog, "a_texCoord"); offGl.enableVertexAttribArray(tl); offGl.vertexAttribPointer(tl, 2, offGl.FLOAT, false, 0, 0);
           offGl.activeTexture(offGl.TEXTURE0); offGl.bindTexture(offGl.TEXTURE_2D, readTex);
           offGl.uniform1i(offGl.getUniformLocation(prog, "u_image"), 0);
@@ -1217,7 +1579,22 @@ export default function FiltersWorkspace({
             offGl.uniform1f(offGl.getUniformLocation(prog, k), v);
           });
           offGl.drawArrays(offGl.TRIANGLE_STRIP, 0, 4);
-          if (!isLast && enabledEffects.length > 1) readTex = fbos2[j % 2].texture;
+          if (!renderToCanvas) {
+            readTex = fbos2[j % 2].texture;
+            readTexBuffer = framebufferTb;
+          }
+        }
+        if (needsTextOverlay) {
+          overlayProgram = drawTextOverlayWebGL({
+            gl: offGl,
+            program: overlayProgram,
+            posBuffer: pb,
+            texBuffer: readTexBuffer,
+            baseTexture: readTex,
+            textOverlay,
+            width: offCanvas.width,
+            height: offCanvas.height,
+          });
         }
 
         const blob = await new Promise(resolve => offCanvas.toBlob(resolve, "image/png"));
@@ -1231,28 +1608,35 @@ export default function FiltersWorkspace({
       }
       await new Promise(r => setTimeout(r, 10));
     }
+    Object.values(programs).forEach(p => offGl.deleteProgram(p));
+    if (overlayProgram) offGl.deleteProgram(overlayProgram);
   };
 
   const downloadBatchZIP = async () => {
     const doneItems = batchQueue.filter(q => q.status === "done" && q.resultBlob);
     if (doneItems.length === 0) return;
+    const formatName = safeFilePart(activeFormat);
     const entries = doneItems.map((q, i) => ({
-      name: `shader_${q.name.replace(/\.[^.]+$/, "")}_${i + 1}.png`, blob: q.resultBlob,
+      name: `shader_${safeFilePart(q.name)}_${formatName}_${i + 1}.png`, blob: q.resultBlob,
     }));
     const zip = await createZIP(entries);
-    const url = URL.createObjectURL(zip);
-    const link = document.createElement("a"); link.download = `shader_batch_${doneItems.length}.zip`;
-    link.href = url; link.click(); URL.revokeObjectURL(url);
+    triggerDownload(zip, `shader_batch_${doneItems.length}_${formatName}.zip`);
   };
 
-  const clearBatch = () => { setBatchQueue([]); setBatchMode(false); setBatchProgress({ current: 0, total: 0 }); };
+  const clearBatch = () => { setBatchQueue([]); setBatchProgress({ current: 0, total: 0 }); };
 
   // ── Exports ──
-  const downloadPNG = () => {
+  const downloadPNG = async () => {
     const c = canvasRef.current; if (!c) return;
-    const link = document.createElement("a");
-    link.download = `shader_${activeShader}_${activeFormat}.png`;
-    link.href = c.toDataURL("image/png"); link.click();
+    try {
+      renderFrame(timeRef.current || 0);
+      glRef.current?.finish?.();
+      const blob = await canvasToBlob(c, "image/png");
+      triggerDownload(blob, `shader_${safeFilePart(activeShader)}_${safeFilePart(activeFormat)}.png`);
+    } catch (error) {
+      console.error("PNG export failed:", error);
+      setRenderError("PNG export failed. Try a smaller canvas or reload the image.");
+    }
   };
 
   const downloadGIF = async () => {
@@ -1272,15 +1656,28 @@ export default function FiltersWorkspace({
       enc.addFrame(ctx); setExportProgress(Math.round(((i+1)/frames)*100));
       await new Promise(r => setTimeout(r, 10));
     }
-    const blob = enc.finish(); const url = URL.createObjectURL(blob);
-    const link = document.createElement("a"); link.download = `shader_${activeShader}.gif`; link.href = url; link.click();
-    URL.revokeObjectURL(url); setExporting(false); setExportProgress(0); timeRef.current = 0;
+    const blob = enc.finish();
+    triggerDownload(blob, `shader_${safeFilePart(activeShader)}_${safeFilePart(activeFormat)}.gif`);
+    setExporting(false); setExportProgress(0); timeRef.current = 0;
+  };
+
+  const cleanupRecordingResources = () => {
+    if (recordProgressIntervalRef.current) {
+      clearInterval(recordProgressIntervalRef.current);
+      recordProgressIntervalRef.current = null;
+    }
+    recordStreamRef.current?.getTracks?.().forEach(track => track.stop?.());
+    recordStreamRef.current = null;
   };
 
   // ── Video Recording (MP4/WebM) ──
   const recordVideo = async () => {
     const canvas = canvasRef.current;
     if (!canvas || !image || recording) return;
+    if (typeof MediaRecorder === "undefined" || typeof canvas.captureStream !== "function") {
+      alert('Video recording not supported in this browser. Try Chrome or Firefox.');
+      return;
+    }
 
     // Detect best supported format
     const mimeTypes = [
@@ -1308,6 +1705,7 @@ export default function FiltersWorkspace({
 
     // Capture stream from canvas at 30fps
     const stream = canvas.captureStream(30);
+    recordStreamRef.current = stream;
     const recorder = new MediaRecorder(stream, {
       mimeType,
       videoBitsPerSecond: 5000000, // 5 Mbps for quality
@@ -1319,15 +1717,18 @@ export default function FiltersWorkspace({
     };
 
     recorder.onstop = () => {
+      cleanupRecordingResources();
       const blob = new Blob(recordChunksRef.current, { type: mimeType });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.download = `shader_${activeShader}_${recordSec}s.${ext}`;
-      link.href = url;
-      link.click();
-      URL.revokeObjectURL(url);
+      triggerDownload(blob, `shader_${safeFilePart(activeShader)}_${safeFilePart(activeFormat)}_${recordSec}s.${ext}`);
       setRecording(false);
       setRecordProgress(0);
+    };
+
+    recorder.onerror = () => {
+      cleanupRecordingResources();
+      setRecording(false);
+      setRecordProgress(0);
+      setRenderError("Video export failed. Try a shorter recording or another browser.");
     };
 
     // Request data every 100ms for smooth progress
@@ -1336,12 +1737,12 @@ export default function FiltersWorkspace({
     // Progress timer
     const duration = recordSec * 1000;
     const startTime = Date.now();
-    const progressInterval = setInterval(() => {
+    recordProgressIntervalRef.current = setInterval(() => {
       const elapsed = Date.now() - startTime;
       const pct = Math.min(100, Math.round((elapsed / duration) * 100));
       setRecordProgress(pct);
       if (elapsed >= duration) {
-        clearInterval(progressInterval);
+        cleanupRecordingResources();
         if (recorder.state === 'recording') recorder.stop();
       }
     }, 50);
@@ -1355,17 +1756,25 @@ export default function FiltersWorkspace({
 
   // ── Presets ──
   const applyPreset = (p) => {
-    setEffectStack([{
-      id: "preset_" + Date.now().toString(36),
-      shaderKey: p.shader, params: { ...p.params }, intensity: 1.0, enabled: true
-    }]);
-    setSelectedEffectIdx(0);
+    commitEditorState(current => ({
+      ...current,
+      effectStack: [createEffectEntry(p.shader, p.params)],
+      selectedEffectIdx: 0,
+      textOverlay: p.textOverlay ? { ...current.textOverlay, ...p.textOverlay } : current.textOverlay,
+    }));
   };
 
   const savePreset = () => {
     const name = prompt("Preset name:");
     if (!name) return;
-    setCustomPresets(prev => [...prev, { name, shader: activeShader, icon: "💾", params: { ...params } }]);
+    const preset = { name: name.trim(), shader: activeShader, icon: "💾", params: { ...params } };
+    if (isTextOverlayActive(textOverlay)) preset.textOverlay = { ...textOverlay };
+    if (!preset.name) return;
+    setCustomPresets(prev => [preset, ...prev.filter(item => item.name !== preset.name)].slice(0, 24));
+  };
+
+  const deleteCustomPreset = (name) => {
+    setCustomPresets(prev => prev.filter(item => item.name !== name));
   };
 
   // ── Compare slider ──
@@ -1397,6 +1806,30 @@ export default function FiltersWorkspace({
     return g;
   }, []);
 
+  const filteredGrouped = useMemo(() => {
+    const query = effectSearch.trim().toLowerCase();
+    if (!query) return grouped;
+
+    return Object.fromEntries(
+      Object.entries(grouped)
+        .map(([cat, shaders]) => [
+          cat,
+          shaders.filter((shaderEntry) => {
+            const searchable = [
+              shaderEntry.label,
+              shaderEntry.desc,
+              CATEGORIES[shaderEntry.cat],
+              shaderEntry.key,
+            ].join(" ").toLowerCase();
+            return searchable.includes(query);
+          }),
+        ])
+        .filter(([, shaders]) => shaders.length > 0)
+    );
+  }, [effectSearch, grouped]);
+
+  const hasEffectResults = Object.keys(filteredGrouped).length > 0;
+
   // ════════════════════ RENDER ════════════════════
   const S = { // Shared styles
     bg: "#08080a", panel: "#0e0e12", border: "#1a1a22", accent: "#8b5cf6", accentDim: "#6d28d9",
@@ -1404,11 +1837,12 @@ export default function FiltersWorkspace({
   };
 
   return (
-    <div style={{ height: "100vh", overflow: "hidden", background: S.bg, color: S.text, fontFamily: "'JetBrains Mono','SF Mono',monospace", display: hidden ? "none" : "flex", flexDirection: "column" }}>
+    <div className="filters-root" style={{ height: "100vh", overflow: "hidden", background: S.bg, color: S.text, fontFamily: "'JetBrains Mono','SF Mono',monospace", display: "flex", flexDirection: "column" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap');
         *{box-sizing:border-box;margin:0;padding:0}
         ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:${S.panel}}::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
+        .filters-root{height:100dvh!important}
         input[type=range]{-webkit-appearance:none;width:100%;height:3px;background:${S.subtle};border-radius:2px;outline:none}
         input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#fff;cursor:pointer;border:2px solid ${S.bg};box-shadow:0 0 6px rgba(139,92,246,0.3)}
         @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
@@ -1416,46 +1850,85 @@ export default function FiltersWorkspace({
         .img-card:hover .img-remove{opacity:1}
         .btn{padding:7px 12px;border:1px solid ${S.border};border-radius:6px;font-size:10px;cursor:pointer;letter-spacing:.04em;font-family:inherit;transition:all .15s}
         .btn:hover{border-color:${S.accent};color:#fff}
+        .btn:disabled{opacity:.35;cursor:not-allowed;border-color:${S.border}!important;color:${S.dim}!important}
+        .filters-root button:focus-visible,.filters-root input:focus-visible,.filters-root select:focus-visible{outline:2px solid ${S.accent};outline-offset:2px}
         .btn-primary{background:${S.accent};border-color:${S.accent};color:#fff;font-weight:600}
         .btn-primary:hover{background:${S.accentDim}}
         .tab{padding:8px 14px;border:none;background:none;color:${S.muted};font-size:10px;cursor:pointer;letter-spacing:.08em;font-family:inherit;border-bottom:2px solid transparent;transition:all .15s}
         .tab.active{color:#fff;border-bottom-color:${S.accent}}
+        .filters-title{display:flex;align-items:baseline;gap:8px;white-space:nowrap}
+        .filters-header-nav{display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap}
+        .filters-history-actions{display:flex;gap:2px;align-items:center;padding:2px;border:1px solid ${S.border};border-radius:7px;background:#09090d}
+        .filters-history-button{width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;padding:0!important;border-radius:5px!important;font-size:15px!important;line-height:1}
+        .filters-export-toolbar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;justify-content:flex-end}
+        .filters-header-status{font-size:9px;color:${S.dim};letter-spacing:.08em;text-transform:uppercase}
+        .filters-upload-card{outline:1px solid rgba(255,255,255,.02);box-shadow:0 28px 90px rgba(0,0,0,.22)}
+        .filters-sidebar-tabs{overflow-x:auto}
+        .filters-search{width:100%;height:34px;margin:0 0 12px;padding:0 10px;border:1px solid ${S.border};border-radius:7px;background:#09090d;color:#ddd;font-family:inherit;font-size:11px}
+        .filters-search::placeholder{color:${S.dim}}
+        @media (max-width: 760px){
+          .filters-root{overflow:auto!important}
+          .filters-header{align-items:flex-start!important;padding:12px 14px!important}
+          .filters-header-main{width:100%!important;justify-content:space-between!important;gap:10px!important}
+          .filters-header-nav{width:100%!important;justify-content:space-between!important;align-items:flex-start!important}
+          .filters-export-toolbar{width:100%;display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:6px!important}
+          .filters-export-toolbar .btn,.filters-export-toolbar select{width:100%!important;min-width:0!important}
+          .filters-shell{flex-direction:column!important;overflow:visible!important;min-height:auto!important}
+          .filters-sidebar{width:100%!important;max-height:none!important;border-right:0!important;border-bottom:1px solid ${S.border}!important}
+          .filters-sidebar-panel{max-height:44dvh!important}
+          .filters-sidebar-tabs .tab{flex:1 0 auto}
+          .filters-main{min-height:56dvh!important;order:-1!important}
+          .filters-canvas{min-height:56dvh!important}
+          .filters-upload-card{width:min(92%,420px)!important;max-width:420px!important;min-height:250px!important;aspect-ratio:4/5!important;border-radius:16px!important;padding:18px!important}
+          .filters-upload-title{max-width:220px;text-align:center;line-height:1.25}
+          .filters-upload-meta{max-width:220px;text-align:center;line-height:1.35}
+          .filters-bottom-panel{padding:10px 12px!important}
+        }
+        @media (min-width: 761px) and (max-width: 1100px){
+          .filters-sidebar{width:300px!important}
+          .filters-upload-card{width:min(74%,520px)!important}
+        }
       `}</style>
 
       {/* ── HEADER ── */}
-      <div style={{ padding: "12px 20px", borderBottom: `1px solid ${S.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8, background: S.panel }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <h1 style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 18, fontWeight: 600, letterSpacing: "-.02em", color: "#fff" }}>
-            <span style={{ color: S.accent }}>◆</span> shader.lab
-            <span style={{ fontSize: 10, color: S.dim, fontWeight: 400, marginLeft: 8 }}>v2.1</span>
+      <header className="filters-header" style={{ padding: "12px 20px", borderBottom: `1px solid ${S.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8, background: S.panel }}>
+        <div className="filters-header-main" style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <h1 className="filters-title" style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 18, fontWeight: 600, letterSpacing: 0, color: "#fff" }}>
+            <span style={{ color: S.accent }}>◆</span>
+            <span>shader.lab</span>
+            <span style={{ fontSize: 10, color: S.dim, fontWeight: 400 }}>v2.1</span>
           </h1>
-          <div style={{ display: "flex", gap: 6 }}>
+          {images.length > 0 && (
+            <span className="filters-header-status">
+              {selectedImageIds.size || 1} selected · {FORMATS[activeFormat].label}
+            </span>
+          )}
+        </div>
+        <nav className="filters-header-nav" aria-label="Editor navigation">
+          <div className="filters-history-actions" role="toolbar" aria-label="History actions">
             <button
-              className="btn"
-              onClick={() => setWorkspaceMode("filters")}
-              style={{
-                background: workspaceMode === "filters" ? S.subtle : "transparent",
-                color: workspaceMode === "filters" ? "#fff" : S.muted,
-                borderColor: workspaceMode === "filters" ? S.accent : S.border,
-              }}
+              className="btn filters-history-button"
+              aria-label="Undo"
+              title="Undo (Cmd/Ctrl+Z)"
+              disabled={!canUndo}
+              onClick={undoEditor}
+              style={{ background: "transparent", color: canUndo ? S.muted : S.dim }}
             >
-              FILTER STUDIO
+              {"\u21B6"}
             </button>
             <button
-              className="btn"
-              onClick={() => setWorkspaceMode("ascii")}
-              style={{
-                background: "transparent",
-                color: "#c7b87a",
-                borderColor: "#4a421d",
-              }}
+              className="btn filters-history-button"
+              aria-label="Redo"
+              title="Redo (Cmd/Ctrl+Shift+Z)"
+              disabled={!canRedo}
+              onClick={redoEditor}
+              style={{ background: "transparent", color: canRedo ? S.muted : S.dim }}
             >
-              ASCII STUDIO
+              {"\u21B7"}
             </button>
           </div>
-        </div>
-        {images.length > 0 && (
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+          {images.length > 0 && (
+            <div className="filters-export-toolbar" role="toolbar" aria-label="Export actions">
             <button className="btn" onClick={() => setCompareMode(!compareMode)}
               style={{ background: compareMode ? S.subtle : "transparent", color: compareMode ? "#fff" : S.muted }}>
               {compareMode ? "✕ COMPARE" : "◐ COMPARE"}
@@ -1481,7 +1954,7 @@ export default function FiltersWorkspace({
               ) : `● MP4 ${recordSec}s`}
               {recording && <div style={{ position: "absolute", bottom: 0, left: 0, height: 2, background: "#ef4444", width: `${recordProgress}%`, transition: "width .05s" }} />}
             </button>
-            <select value={recordSec} onChange={e => setRecordSec(Number(e.target.value))}
+            <select aria-label="Recording duration" value={recordSec} onChange={e => setRecordSec(Number(e.target.value))}
               style={{
                 padding: "5px 4px", background: S.panel, border: `1px solid ${S.border}`,
                 borderRadius: 6, color: S.muted, fontSize: 10, fontFamily: "inherit",
@@ -1494,29 +1967,43 @@ export default function FiltersWorkspace({
                 {"\u2193"} ZIP ({batchQueue.filter(q => q.status === "done").length})
               </button>
             )}
-            <button className="btn" onClick={clearAllImages} style={{ background: "transparent", color: S.dim }}>{"\u2715"}</button>
-          </div>
-        )}
-      </div>
+            <button className="btn" aria-label="Clear all images" title="Clear all images" onClick={clearAllImages} style={{ background: "transparent", color: S.dim }}>{"\u2715"}</button>
+            </div>
+          )}
+        </nav>
+      </header>
 
-      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+      <div className="filters-shell" style={{ display: "flex", flex: 1, minHeight: 0 }}>
         {/* ── SIDEBAR ── */}
-        <div style={{ width: 260, flexShrink: 0, borderRight: `1px solid ${S.border}`, display: "flex", flexDirection: "column", background: S.panel }}>
+        <div className="filters-sidebar" style={{ width: 260, flexShrink: 0, borderRight: `1px solid ${S.border}`, display: "flex", flexDirection: "column", background: S.panel }}>
           {/* Tabs */}
-          <div style={{ display: "flex", borderBottom: `1px solid ${S.border}` }}>
-            {[["effects", "EFFECTS"], ["format", "FORMAT"], ["presets", "PRESETS"], ["batch", "BATCH"]].map(([k, l]) => (
+          <div className="filters-sidebar-tabs" style={{ display: "flex", borderBottom: `1px solid ${S.border}` }}>
+            {[["effects", "EFFECTS"], ["format", "FORMAT"], ["text", "TEXT"], ["presets", "PRESETS"], ["batch", "BATCH"]].map(([k, l]) => (
               <button key={k} className={`tab ${tab === k ? "active" : ""}`} onClick={() => setTab(k)}>{l}</button>
             ))}
           </div>
 
-          <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px" }}>
+          <div className="filters-sidebar-panel" style={{ flex: 1, overflowY: "auto", padding: "12px 14px" }}>
             {/* ── Effects Tab ── */}
             {tab === "effects" && (
               <>
+                <input
+                  className="filters-search"
+                  type="search"
+                  aria-label="Search effects"
+                  placeholder="Search effects"
+                  value={effectSearch}
+                  onChange={(event) => setEffectSearch(event.target.value)}
+                />
                 <p style={{ fontSize: 8, color: S.dim, marginBottom: 10, letterSpacing: ".06em" }}>
                   CLICK TO ADD · SWAP TO REPLACE SELECTED
                 </p>
-                {Object.entries(grouped).map(([cat, shaders]) => (
+                {!hasEffectResults && (
+                  <div style={{ padding: 12, border: `1px dashed ${S.border}`, borderRadius: 8, color: S.dim, fontSize: 10, lineHeight: 1.5 }}>
+                    No effects match your search.
+                  </div>
+                )}
+                {Object.entries(filteredGrouped).map(([cat, shaders]) => (
                   <div key={cat} style={{ marginBottom: 14 }}>
                     <p style={{ fontSize: 9, color: S.dim, letterSpacing: ".12em", marginBottom: 8, textTransform: "uppercase" }}>
                       {CATEGORIES[cat]}
@@ -1525,7 +2012,7 @@ export default function FiltersWorkspace({
                       const inStack = effectStack.some(e => e.shaderKey === s.key);
                       return (
                       <div key={s.key} style={{ display: "flex", alignItems: "stretch", gap: 2, marginBottom: 2 }}>
-                        <button onClick={() => addToStack(s.key)} style={{
+                        <button aria-label={`Add ${s.label} effect`} onClick={() => addToStack(s.key)} style={{
                           display: "block", flex: 1, padding: "8px 10px",
                           background: inStack ? S.subtle : "transparent",
                           border: inStack ? `1px solid ${S.border}` : "1px solid transparent",
@@ -1540,10 +2027,13 @@ export default function FiltersWorkspace({
                           </span>
                           <span style={{ display: "block", fontSize: 9, color: S.dim, marginTop: 1 }}>{s.desc}</span>
                         </button>
-                        <button onClick={() => {
-                          setEffectStack(prev => prev.map((e, i) =>
-                            i === selectedEffectIdx ? { ...e, shaderKey: s.key, params: {} } : e
-                          ));
+                        <button aria-label={`Replace selected effect with ${s.label}`} onClick={() => {
+                          commitEditorState(current => ({
+                            ...current,
+                            effectStack: current.effectStack.map((e, i) =>
+                              i === current.selectedEffectIdx ? { ...e, shaderKey: s.key, params: {} } : e
+                            ),
+                          }));
                         }}
                           title="Replace selected effect"
                           style={{
@@ -1566,27 +2056,27 @@ export default function FiltersWorkspace({
                     {effectStack.map((eff, idx) => {
                       const sd = SHADERS[eff.shaderKey];
                       return (
-                        <div key={eff.id} onClick={() => setSelectedEffectIdx(idx)}
+                        <div key={eff.id} onClick={() => selectEffectIdx(idx)}
                           style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 8px", marginBottom: 2,
                             borderRadius: 6, cursor: "pointer", fontSize: 11,
                             background: idx === selectedEffectIdx ? S.subtle : "transparent",
                             border: idx === selectedEffectIdx ? `1px solid ${S.border}` : "1px solid transparent",
                             opacity: eff.enabled ? 1 : 0.4 }}>
                           <span style={{ flex: 1, color: "#fff" }}>{sd?.label || eff.shaderKey}</span>
-                          <input type="range" min={0} max={1} step={0.05} value={eff.intensity}
+                          <input aria-label={`${sd?.label || eff.shaderKey} intensity`} type="range" min={0} max={1} step={0.05} value={eff.intensity}
                             style={{ width: 50, cursor: "pointer" }}
                             onClick={e => e.stopPropagation()}
                             onChange={e => { e.stopPropagation(); setEffectIntensity(idx, parseFloat(e.target.value)); }} />
-                          <button onClick={e => { e.stopPropagation(); toggleEffect(idx); }}
+                          <button aria-label={`${eff.enabled ? "Disable" : "Enable"} ${sd?.label || eff.shaderKey}`} onClick={e => { e.stopPropagation(); toggleEffect(idx); }}
                             style={{ background: "none", border: "none", color: S.dim, fontSize: 10, cursor: "pointer", padding: 2 }}>
                             {eff.enabled ? "\u25CF" : "\u25CB"}
                           </button>
-                          <button onClick={e => { e.stopPropagation(); moveInStack(idx, -1); }}
+                          <button aria-label={`Move ${sd?.label || eff.shaderKey} up`} onClick={e => { e.stopPropagation(); moveInStack(idx, -1); }}
                             style={{ background: "none", border: "none", color: S.dim, fontSize: 10, cursor: "pointer", padding: 2 }}>{"\u25B2"}</button>
-                          <button onClick={e => { e.stopPropagation(); moveInStack(idx, 1); }}
+                          <button aria-label={`Move ${sd?.label || eff.shaderKey} down`} onClick={e => { e.stopPropagation(); moveInStack(idx, 1); }}
                             style={{ background: "none", border: "none", color: S.dim, fontSize: 10, cursor: "pointer", padding: 2 }}>{"\u25BC"}</button>
                           {effectStack.length > 1 && (
-                            <button onClick={e => { e.stopPropagation(); removeFromStack(idx); }}
+                            <button aria-label={`Remove ${sd?.label || eff.shaderKey}`} onClick={e => { e.stopPropagation(); removeFromStack(idx); }}
                               style={{ background: "none", border: "none", color: "#f44", fontSize: 12, cursor: "pointer", padding: 2 }}>{"\u00D7"}</button>
                           )}
                         </div>
@@ -1602,7 +2092,7 @@ export default function FiltersWorkspace({
               <div>
                 <p style={{ fontSize: 9, color: S.dim, letterSpacing: ".1em", marginBottom: 10 }}>CANVAS SIZE</p>
                 {Object.entries(FORMATS).map(([k, f]) => (
-                  <button key={k} onClick={() => setActiveFormat(k)} style={{
+                  <button key={k} onClick={() => commitEditorState(current => ({ ...current, activeFormat: k }))} style={{
                     display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "9px 10px", marginBottom: 2,
                     background: activeFormat === k ? S.subtle : "transparent",
                     border: activeFormat === k ? `1px solid ${S.border}` : "1px solid transparent",
@@ -1616,6 +2106,94 @@ export default function FiltersWorkspace({
                     </div>
                   </button>
                 ))}
+              </div>
+            )}
+
+            {/* ── Text Tab ── */}
+            {tab === "text" && (
+              <div>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14, color: "#ddd", fontSize: 11 }}>
+                  <input
+                    type="checkbox"
+                    aria-label="Enable text overlay"
+                    checked={textOverlay.enabled}
+                    onChange={(event) => commitTextOverlayEnabled(event.target.checked)}
+                  />
+                  Enable text overlay
+                </label>
+                <div style={{ display: "grid", gap: 10, opacity: textOverlay.enabled ? 1 : 0.45 }}>
+                  <label style={{ display: "grid", gap: 5, fontSize: 10, color: S.muted }}>
+                    Text
+                    <input
+                      aria-label="Overlay text"
+                      type="text"
+                      value={textOverlay.text}
+                      disabled={!textOverlay.enabled}
+                      onChange={(event) => updateTextOverlay({ text: event.target.value })}
+                      style={{ width: "100%", height: 34, padding: "0 10px", border: `1px solid ${S.border}`, borderRadius: 7, background: "#09090d", color: "#eee", fontFamily: "inherit" }}
+                    />
+                  </label>
+                  <label style={{ display: "grid", gap: 5, fontSize: 10, color: S.muted }}>
+                    Font
+                    <select
+                      aria-label="Overlay font"
+                      value={textOverlay.fontFamily}
+                      disabled={!textOverlay.enabled}
+                      onChange={(event) => updateTextOverlay({ fontFamily: event.target.value })}
+                      style={{ width: "100%", height: 34, padding: "0 10px", border: `1px solid ${S.border}`, borderRadius: 7, background: "#09090d", color: "#eee", fontFamily: "inherit" }}
+                    >
+                      {Object.entries(TEXT_FONTS).map(([key, font]) => <option key={key} value={key}>{font.label}</option>)}
+                    </select>
+                  </label>
+                  <label style={{ display: "grid", gap: 6, fontSize: 10, color: S.muted }}>
+                    Color
+                    <input
+                      aria-label="Text color"
+                      type="color"
+                      value={textOverlay.color}
+                      disabled={!textOverlay.enabled}
+                      onChange={(event) => updateTextOverlay({ color: event.target.value })}
+                      style={{ width: "100%", height: 34, border: `1px solid ${S.border}`, borderRadius: 7, background: "#09090d" }}
+                    />
+                  </label>
+                  {[
+                    ["Text size", "fontSize", 24, 260, 1],
+                    ["Text opacity", "opacity", 0, 1, 0.01],
+                    ["Text X position", "x", 0, 1, 0.01],
+                    ["Text Y position", "y", 0, 1, 0.01],
+                    ["Text rotation", "rotation", -45, 45, 1],
+                  ].map(([label, key, min, max, step]) => (
+                    <label key={key} style={{ display: "grid", gap: 6, fontSize: 10, color: S.muted }}>
+                      <span style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                        <span>{label}</span>
+                        <span style={{ color: S.dim }}>{Number(textOverlay[key]).toFixed(step < 1 ? 2 : 0)}</span>
+                      </span>
+                      <input
+                        aria-label={label}
+                        type="range"
+                        min={min}
+                        max={max}
+                        step={step}
+                        value={textOverlay[key]}
+                        disabled={!textOverlay.enabled}
+                        onChange={(event) => updateTextOverlay({ [key]: Number(event.target.value) })}
+                      />
+                    </label>
+                  ))}
+                  <div role="group" aria-label="Text alignment" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 4 }}>
+                    {["left", "center", "right"].map((align) => (
+                      <button
+                        key={align}
+                        className="btn"
+                        disabled={!textOverlay.enabled}
+                        onClick={() => updateTextOverlay({ align })}
+                        style={{ background: textOverlay.align === align ? S.subtle : "transparent", color: textOverlay.align === align ? "#fff" : S.muted, textTransform: "uppercase", padding: "7px 6px" }}
+                      >
+                        {align}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
             )}
 
@@ -1638,27 +2216,48 @@ export default function FiltersWorkspace({
                 </div>
                 {customPresets.length > 0 && (
                   <>
-                    <p style={{ fontSize: 9, color: S.dim, letterSpacing: ".1em", margin: "16px 0 10px" }}>CUSTOM</p>
+                    <p style={{ fontSize: 9, color: S.dim, letterSpacing: ".1em", margin: "16px 0 10px" }}>LOCAL PRESETS</p>
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
                       {customPresets.map((p, i) => (
-                        <button key={i} onClick={() => applyPreset(p)} style={{
-                          padding: "10px 8px", background: "rgba(139,92,246,.08)", border: `1px solid rgba(139,92,246,.2)`,
-                          borderRadius: 8, color: "#ccc", fontSize: 10, cursor: "pointer",
-                          fontFamily: "'Space Grotesk',sans-serif", textAlign: "center",
-                        }}>
-                          <div style={{ fontSize: 18, marginBottom: 4 }}>{p.icon}</div>
-                          <div style={{ fontWeight: 500 }}>{p.name}</div>
-                        </button>
+                        <div key={`${p.name}-${i}`} style={{ position: "relative" }}>
+                          <button aria-label={`Apply local preset ${p.name}`} onClick={() => applyPreset(p)} style={{
+                            width: "100%", minHeight: 78, padding: "10px 24px 10px 8px", background: "rgba(139,92,246,.08)", border: `1px solid rgba(139,92,246,.2)`,
+                            borderRadius: 8, color: "#ccc", fontSize: 10, cursor: "pointer",
+                            fontFamily: "'Space Grotesk',sans-serif", textAlign: "center",
+                          }}>
+                            <div style={{ fontSize: 18, marginBottom: 4 }}>{p.icon}</div>
+                            <div style={{ fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</div>
+                            <div style={{ fontSize: 8, color: S.dim, marginTop: 2 }}>{SHADERS[p.shader]?.label}</div>
+                          </button>
+                          <button
+                            type="button"
+                            aria-label={`Delete local preset ${p.name}`}
+                            onClick={() => deleteCustomPreset(p.name)}
+                            style={{
+                              position: "absolute", top: 5, right: 5,
+                              width: 18, height: 18, borderRadius: 5,
+                              background: "rgba(0,0,0,.35)", border: `1px solid ${S.border}`,
+                              color: S.dim, cursor: "pointer", fontSize: 10, lineHeight: 1,
+                            }}
+                          >
+                            {"\u00D7"}
+                          </button>
+                        </div>
                       ))}
                     </div>
                   </>
+                )}
+                {customPresets.length === 0 && (
+                  <div style={{ marginTop: 16, padding: 12, border: `1px dashed ${S.border}`, borderRadius: 8, color: S.dim, fontSize: 10, lineHeight: 1.5 }}>
+                    No local presets saved.
+                  </div>
                 )}
               </div>
             )}
 
             {tab === "batch" && (
               <div>
-                <input ref={batchFileInputRef} type="file" accept="image/*" multiple hidden
+                <input ref={batchFileInputRef} aria-label="Batch images" type="file" accept="image/*" multiple hidden
                   onChange={e => { addFilesToQueue(e.target.files); e.target.value = ""; }} />
                 <button className="btn" onClick={() => batchFileInputRef.current?.click()}
                   style={{ width: "100%", background: S.subtle, color: "#fff", border: `1px dashed ${S.border}`,
@@ -1717,20 +2316,24 @@ export default function FiltersWorkspace({
         </div>
 
         {/* ── MAIN AREA (canvas + params) ── */}
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
-        <div ref={infiniteCanvasRef} style={{ flex: 1, position: "relative", overflow: "hidden", cursor: isPanning ? "grabbing" : "default" }}
+        <div className="filters-main" style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+        <div className="filters-canvas" ref={infiniteCanvasRef} style={{ flex: 1, position: "relative", overflow: "hidden", cursor: isPanning ? "grabbing" : "default" }}
           onMouseDown={handleCanvasPanStart} onMouseMove={handleCanvasPanMove} onMouseUp={handleCanvasPanEnd} onMouseLeave={handleCanvasPanEnd}
           onDragOver={e => { e.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={handleDrop}>
           <input ref={fileInputRef} type="file" accept="image/*" multiple
             onChange={e => { Array.from(e.target.files).forEach(f => handleImageLoad(f)); e.target.value = ""; }}
             style={{ display: "none" }} />
           {images.length === 0 ? (
-            <div onClick={() => fileInputRef.current?.click()}
+            <button
+              type="button"
+              aria-label="Upload images"
+              onClick={() => fileInputRef.current?.click()}
               style={{
                 position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center",
-                cursor: "pointer",
-              }}>
-              <div style={{
+                cursor: "pointer", background: "transparent", border: 0, color: "inherit", font: "inherit",
+              }}
+            >
+              <div className="filters-upload-card" style={{
                 width: "80%", maxWidth: 500, aspectRatio: "16/10",
                 border: `2px dashed ${isDragging ? S.accent : S.border}`,
                 borderRadius: 20, display: "flex", flexDirection: "column",
@@ -1738,10 +2341,10 @@ export default function FiltersWorkspace({
                 transition: "all .2s", background: isDragging ? "rgba(139,92,246,.03)" : "transparent",
               }}>
                 <div style={{ width: 56, height: 56, borderRadius: 14, background: S.panel, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 18, fontSize: 24, color: S.muted, border: `1px solid ${S.border}` }}>+</div>
-                <p style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 15, color: S.muted, marginBottom: 6 }}>Drop images or click to upload</p>
-                <p style={{ fontSize: 11, color: S.dim }}>PNG, JPG, WebP — multiple allowed</p>
+                <p className="filters-upload-title" style={{ fontFamily: "'Space Grotesk',sans-serif", fontSize: 15, color: S.muted, marginBottom: 6 }}>Drop images or click to upload</p>
+                <p className="filters-upload-meta" style={{ fontSize: 11, color: S.dim }}>PNG, JPG, WebP · multiple allowed</p>
               </div>
-            </div>
+            </button>
           ) : (
             <>
               {/* Grid content with pan/zoom transform */}
@@ -1756,8 +2359,19 @@ export default function FiltersWorkspace({
                   const isSelected = selectedImageIds.has(item.id);
                   return (
                   <div key={item.id} className="img-card"
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Select image ${item.name}`}
+                    aria-pressed={isSelected}
                     onMouseDown={(e) => e.stopPropagation()}
                     onClick={(e) => { e.stopPropagation(); handleSelectImage(item.id, e); }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        handleSelectImage(item.id, e);
+                      }
+                    }}
                     style={{
                       position: "absolute", left: item.gx, top: item.gy,
                       width: item.gw, height: item.gh,
@@ -1770,6 +2384,7 @@ export default function FiltersWorkspace({
                     <img src={item.processedSrc || item.src} draggable={false}
                       style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
                     <button className="img-remove"
+                      aria-label={`Remove image ${item.name}`}
                       onClick={(e) => { e.stopPropagation(); handleRemoveImage(item.id); }}
                       style={{
                         position: "absolute", top: 6, right: 6,
@@ -1848,7 +2463,9 @@ export default function FiltersWorkspace({
                 })()}
 
                 {/* Add image button */}
-                <div
+                <button
+                  type="button"
+                  aria-label="Add image"
                   onMouseDown={(e) => e.stopPropagation()}
                   onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
                   style={{
@@ -1861,10 +2478,11 @@ export default function FiltersWorkspace({
                     cursor: "pointer", color: S.muted, fontSize: 12,
                     fontFamily: "'Space Grotesk',sans-serif",
                     transition: "border-color 0.15s",
+                    background: "transparent",
                   }}>
                   <span style={{ fontSize: 22, marginBottom: 4, opacity: 0.5 }}>+</span>
                   Add Image
-                </div>
+                </button>
               </div>
 
               {/* Drag overlay */}
@@ -1877,6 +2495,25 @@ export default function FiltersWorkspace({
                   pointerEvents: "none",
                 }}>
                   <p style={{ color: S.accent, fontSize: 16, fontFamily: "'Space Grotesk',sans-serif" }}>Drop images to add</p>
+                </div>
+              )}
+
+              {renderError && (
+                <div
+                  role="alert"
+                  style={{
+                    position: "absolute", top: 12, right: 12, zIndex: 20,
+                    maxWidth: 320, padding: "10px 12px",
+                    border: "1px solid rgba(239,68,68,.45)",
+                    borderRadius: 8,
+                    background: "rgba(45,10,16,.92)",
+                    color: "#fecaca",
+                    fontSize: 11,
+                    lineHeight: 1.45,
+                    boxShadow: "0 12px 40px rgba(0,0,0,.28)",
+                  }}
+                >
+                  {renderError}
                 </div>
               )}
 
@@ -1930,7 +2567,7 @@ export default function FiltersWorkspace({
 
         {/* ── PARAMETER BOTTOM PANEL ── */}
         {primarySelectedId && image && shader && (
-          <div style={{ borderTop: `1px solid ${S.border}`, background: S.panel, padding: "10px 20px", flexShrink: 0 }}>
+          <div className="filters-bottom-panel" style={{ borderTop: `1px solid ${S.border}`, background: S.panel, padding: "10px 20px", flexShrink: 0 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 20, overflowX: "auto" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
                 <p style={{ fontSize: 9, color: S.dim, letterSpacing: ".1em" }}>
@@ -1938,20 +2575,20 @@ export default function FiltersWorkspace({
                 </p>
                 {effectStack.length > 1 && (
                   <>
-                    <button onClick={() => setSelectedEffectIdx(Math.max(0, selectedEffectIdx - 1))}
+                    <button aria-label="Select previous effect parameters" onClick={() => selectEffectIdx(Math.max(0, selectedEffectIdx - 1))}
                       style={{ background: "none", border: "none", color: S.dim, fontSize: 11, cursor: "pointer" }}>{"\u25C4"}</button>
-                    <button onClick={() => setSelectedEffectIdx(Math.min(effectStack.length - 1, selectedEffectIdx + 1))}
+                    <button aria-label="Select next effect parameters" onClick={() => selectEffectIdx(Math.min(effectStack.length - 1, selectedEffectIdx + 1))}
                       style={{ background: "none", border: "none", color: S.dim, fontSize: 11, cursor: "pointer" }}>{"\u25BA"}</button>
                   </>
                 )}
-                <button onClick={resetParams} style={{ background: "none", border: "none", color: S.dim, fontSize: 9, cursor: "pointer" }}>RESET</button>
+                <button aria-label="Reset selected effect parameters" onClick={resetParams} style={{ background: "none", border: "none", color: S.dim, fontSize: 9, cursor: "pointer" }}>RESET</button>
               </div>
               {Object.entries(shader.uniforms).map(([key, u]) => {
                 const val = params[key] !== undefined ? params[key] : u.default;
                 return (
                   <div key={key} style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, minWidth: 180 }}>
-                    <label style={{ fontSize: 10, color: "#999", flexShrink: 0 }}>{u.label}</label>
-                    <input type="range" min={u.min} max={u.max} step={u.step} value={val}
+                    <label htmlFor={`filter-param-${key}`} style={{ fontSize: 10, color: "#999", flexShrink: 0 }}>{u.label}</label>
+                    <input id={`filter-param-${key}`} type="range" min={u.min} max={u.max} step={u.step} value={val}
                       style={{ flex: 1, minWidth: 80 }}
                       onChange={e => setParams(p => ({ ...p, [key]: parseFloat(e.target.value) }))} />
                     <span style={{ fontSize: 10, color: S.muted, fontVariantNumeric: "tabular-nums", flexShrink: 0, minWidth: 32, textAlign: "right" }}>

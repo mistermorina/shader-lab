@@ -1,0 +1,18 @@
+{
+  "name": "shader.lab",
+  "short_name": "shader.lab",
+  "description": "Browser-based WebGL shader studio with real-time social exports.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#08080a",
+  "background_color": "#08080a",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

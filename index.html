@@ -4,9 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>shader.lab — WebGL Image Filter Studio</title>
-    <meta name="description" content="Real-time WebGL image filters: Glitch, VHS, Halftone, Wobble, Neon, ASCII & more. Export as PNG, GIF or MP4." />
+    <meta name="description" content="Real-time WebGL image filters: Glitch, VHS, Halftone, Wobble, Neon and more. Export as PNG, GIF or MP4." />
     <meta name="theme-color" content="#08080a" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="shader.lab" />
     <style>
       * { margin: 0; padding: 0; box-sizing: border-box; }
       html, body, #root { height: 100%; width: 100%; overflow: hidden; }
@@ -16,5 +19,12 @@
   <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
+    <script type="module">
+      if (import.meta.env.PROD && "serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("/sw.js");
+        });
+      }
+    </script>
   </body>
 </html>

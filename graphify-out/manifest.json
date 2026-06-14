@@ -1,0 +1,177 @@
+{
+  ".claude/launch.json": {
+    "mtime": 1772113935.6278586,
+    "ast_hash": "eadc7f7aa4bc87ae9ce90bc5b2d72fdf",
+    "semantic_hash": ""
+  },
+  ".claude/settings.local.json": {
+    "mtime": 1772057581.4189055,
+    "ast_hash": "5dfea0982079b838f6718c9dba09cdd7",
+    "semantic_hash": ""
+  },
+  "package.json": {
+    "mtime": 1772044936.0,
+    "ast_hash": "a8b8522743f9f09f8ef57c8d907ffc01",
+    "semantic_hash": ""
+  },
+  "src/AsciiWorkspace.jsx": {
+    "mtime": 1772821228.5400896,
+    "ast_hash": "39b29a1212d54c9ef47a3f673c19aaa0",
+    "semantic_hash": ""
+  },
+  "src/FiltersWorkspace.jsx": {
+    "mtime": 1772801076.0553799,
+    "ast_hash": "1d6d11864cc8930cd0ca662978a1edee",
+    "semantic_hash": ""
+  },
+  "src/ShaderLab.jsx": {
+    "mtime": 1772800687.318678,
+    "ast_hash": "860bdf3ba91b262b2c37377cc9d494df",
+    "semantic_hash": ""
+  },
+  "src/lib/GIFEncoder.js": {
+    "mtime": 1772801044.2607522,
+    "ast_hash": "50baf185e2c5670204d8f90b91a7b12b",
+    "semantic_hash": ""
+  },
+  "src/lib/asciiRenderer.js": {
+    "mtime": 1772821172.35945,
+    "ast_hash": "9100c9dc80b8cf6445904940c3173572",
+    "semantic_hash": ""
+  },
+  "src/lib/formats.js": {
+    "mtime": 1772800721.8034244,
+    "ast_hash": "f80b1a4ad1ffcfdfcad2c1d0c42cddb6",
+    "semantic_hash": ""
+  },
+  "src/lib/imageUtils.js": {
+    "mtime": 1772807271.948933,
+    "ast_hash": "d447f6562532a103e2ec1a112ca03902",
+    "semantic_hash": ""
+  },
+  "src/lib/mediaSources.js": {
+    "mtime": 1772807674.5547252,
+    "ast_hash": "64f908c7b97efcecd44797cf7c154073",
+    "semantic_hash": ""
+  },
+  "src/lib/rendererContract.js": {
+    "mtime": 1772800721.8036554,
+    "ast_hash": "07ac216a099da6b596ee761032fc1402",
+    "semantic_hash": ""
+  },
+  "src/main.jsx": {
+    "mtime": 1772044952.0,
+    "ast_hash": "62e4099a32ce08aa2c28ebd3fae9f35d",
+    "semantic_hash": ""
+  },
+  "vite.config.js": {
+    "mtime": 1772801079.4600925,
+    "ast_hash": "2eafd3cd568ba29cb6a0c2522b7fc9ed",
+    "semantic_hash": ""
+  },
+  ".github/ISSUE_TEMPLATE/bug_report.md": {
+    "mtime": 1772045352.0,
+    "ast_hash": "d05f864bc748adfff14f34a72b3f2bd1",
+    "semantic_hash": ""
+  },
+  ".github/ISSUE_TEMPLATE/feature_request.md": {
+    "mtime": 1772045357.0,
+    "ast_hash": "79eb2b5178f9651d756a641f139076cd",
+    "semantic_hash": ""
+  },
+  ".github/ISSUE_TEMPLATE/new_shader.md": {
+    "mtime": 1772045365.0,
+    "ast_hash": "e8cb58fd699bd0d4236d8ed95cc9aff0",
+    "semantic_hash": ""
+  },
+  ".github/pull_request_template.md": {
+    "mtime": 1772045373.0,
+    "ast_hash": "30b49d7f1ec9c0d02c92f8bf67f57718",
+    "semantic_hash": ""
+  },
+  ".github/workflows/ci.yml": {
+    "mtime": 1772045380.0,
+    "ast_hash": "0214b49e679ff81056dcb781ed069655",
+    "semantic_hash": ""
+  },
+  ".github/workflows/deploy.yml": {
+    "mtime": 1772045388.0,
+    "ast_hash": "b7ac789a4d3f36f8a2d3c62807b4e397",
+    "semantic_hash": ""
+  },
+  "CODE_OF_CONDUCT.md": {
+    "mtime": 1772045342.0,
+    "ast_hash": "9414539b2201a877e3451879f5e8b5f1",
+    "semantic_hash": ""
+  },
+  "CONTRIBUTING.md": {
+    "mtime": 1772045335.0,
+    "ast_hash": "1de0691d797942f083eeb42a18798ecf",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1772045452.0,
+    "ast_hash": "0fed6b9b9f5ebdf1da25ea9e14285d62",
+    "semantic_hash": ""
+  },
+  "docs/ai/AGENT_WORKFLOW.md": {
+    "mtime": 1781166610.047772,
+    "ast_hash": "887f790afb8b4aef4e9f13de3b624fb7",
+    "semantic_hash": ""
+  },
+  "docs/ai/ARCHITECTURE_NOTES.md": {
+    "mtime": 1781166610.0470016,
+    "ast_hash": "6f4d8ba8eda06db5e7969d6287d25302",
+    "semantic_hash": ""
+  },
+  "docs/ai/GRAPHIFY_QUERIES.md": {
+    "mtime": 1781166610.047561,
+    "ast_hash": "894f65846e2c35251e6f69fbac61ac0b",
+    "semantic_hash": ""
+  },
+  "docs/ai/GRAPHIFY_SCOPE.md": {
+    "mtime": 1781166610.0473478,
+    "ast_hash": "c0bc97606b4d8f8fab6fb1bf897e7979",
+    "semantic_hash": ""
+  },
+  "docs/ai/PROJECT_CONTEXT.md": {
+    "mtime": 1781166610.046674,
+    "ast_hash": "547feafe99001cb309737f617f89fe15",
+    "semantic_hash": ""
+  },
+  "docs/ai/backups/20260611-102847/AGENT_WORKFLOW.md": {
+    "mtime": 1781166474.2032652,
+    "ast_hash": "887f790afb8b4aef4e9f13de3b624fb7",
+    "semantic_hash": ""
+  },
+  "docs/ai/backups/20260611-102847/ARCHITECTURE_NOTES.md": {
+    "mtime": 1781166474.2030168,
+    "ast_hash": "6f4d8ba8eda06db5e7969d6287d25302",
+    "semantic_hash": ""
+  },
+  "docs/ai/backups/20260611-102847/GRAPHIFY_QUERIES.md": {
+    "mtime": 1781166474.203192,
+    "ast_hash": "894f65846e2c35251e6f69fbac61ac0b",
+    "semantic_hash": ""
+  },
+  "docs/ai/backups/20260611-102847/GRAPHIFY_SCOPE.md": {
+    "mtime": 1781166474.2031083,
+    "ast_hash": "c0bc97606b4d8f8fab6fb1bf897e7979",
+    "semantic_hash": ""
+  },
+  "docs/ai/backups/20260611-102847/PROJECT_CONTEXT.md": {
+    "mtime": 1781166474.202894,
+    "ast_hash": "547feafe99001cb309737f617f89fe15",
+    "semantic_hash": ""
+  },
+  "index.html": {
+    "mtime": 1772044948.0,
+    "ast_hash": "2fc60d043ba48e351c06f01d7a30ff12",
+    "semantic_hash": ""
+  },
+  "public/favicon.svg": {
+    "mtime": 1772044963.0,
+    "ast_hash": "b07a248768836796f0fa90bb83f9c911",
+    "semantic_hash": ""
+  }
+}

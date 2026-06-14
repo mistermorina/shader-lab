@@ -2,9 +2,9 @@
 
 # ◆ shader.lab
 
-**WebGL Image Filter Studio**
+**Browser WebGL Shader Studio**
 
-Real-time shader effects with PNG, GIF & MP4 export — zero dependencies, runs in your browser.
+Real-time WebGL filters, text overlays, local presets, batch processing, offline app shell, and PNG/GIF/MP4 export — runs entirely in your browser.
 
 [![CI](https://github.com/hasanmorina/shader-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/hasanmorina/shader-lab/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-8b5cf6.svg)](LICENSE)
@@ -19,16 +19,19 @@ Real-time shader effects with PNG, GIF & MP4 export — zero dependencies, runs 
 
 ## ✨ Features
 
-### 11 WebGL Shader Effects
+### 17 WebGL Shader Effects
 
-| Animated | Style | Retro |
-|----------|-------|-------|
+| Animated | Style | Retro / Utility |
+|----------|-------|-----------------|
 | 🌊 Wobble | 🔵 Halftone CMYK | 🖥 ASCII Art |
 | ⚡ Glitch | 📜 Paper Texture | 🎮 Dithering |
-| 📼 VHS | 🔮 Fluted Glass | |
-| | ✨ Bloom | |
-| | 💠 Neon Glow | |
+| 📼 VHS | 🔮 Fluted Glass | 📊 Posterize |
+| | ✨ Bloom | 📺 Scanlines |
+| | 💠 Neon Glow | 🧭 Edge Detect |
 | | 🌈 Chromatic Aberration | |
+| | 🧬 Pixel Sort | |
+| | 🎛 Duotone | |
+| | 🌀 Displacement Map | |
 
 ### Export
 
@@ -40,7 +43,10 @@ Real-time shader effects with PNG, GIF & MP4 export — zero dependencies, runs 
 
 - **Before/After Slider** — Drag to compare original vs effect
 - **Social Media Templates** — IG Post, Story, TikTok, Twitter, YouTube, FB Cover, LinkedIn
+- **Text Overlay** — Built-in font stacks, positioning, rotation, opacity, and export-safe compositing
 - **Preset System** — 10 built-in presets + save your own
+- **Undo/Redo** — History controls and keyboard shortcuts for editor changes
+- **PWA Shell** — Install metadata and offline app-shell fallback
 - **Real-time Controls** — Adjust all parameters with instant feedback
 
 ### Zero Dependencies
@@ -51,6 +57,8 @@ The core engine uses raw WebGL, a custom GIF encoder, and the native MediaRecord
 
 ## 🚀 Quick Start
 
+Requires Node.js `20.19+` or `22.12+`.
+
 ```bash
 git clone https://github.com/hasanmorina/shader-lab.git
 cd shader-lab
@@ -58,7 +66,15 @@ npm install
 npm run dev
 ```
 
-Opens at `http://localhost:3000` — upload an image and play.
+Opens at `http://localhost:5173` — upload an image and play.
+
+Run the production build and contract tests:
+
+```bash
+npm run build
+npm test
+npm run test:pwa
+```
 
 ---
 
@@ -113,7 +129,7 @@ Adding a shader is simple — it's just GLSL + a config object. See the full gui
 **Quick version:**
 
 ```javascript
-// In src/ShaderLab.jsx → SHADERS object
+// In src/FiltersWorkspace.jsx → SHADERS object
 myEffect: {
   label: "My Effect",
   desc: "What it does",
@@ -144,20 +160,20 @@ Then open a PR — we love new effects!
 ## 🗺 Roadmap
 
 - [x] Core WebGL rendering pipeline
-- [x] 11 shader effects
+- [x] 17 shader effects
 - [x] PNG / GIF / MP4 export
 - [x] Before/After compare slider
 - [x] Social media format templates
 - [x] Preset system
-- [ ] **Effect stacking** — chain multiple shaders
-- [ ] **Pixel Sort** shader
-- [ ] **Displacement Map** shader
-- [ ] **Text overlay** with custom fonts
+- [x] Effect stacking
+- [x] Pixel Sort shader
+- [x] Batch processing
+- [x] Mobile-responsive studio shells
+- [x] Displacement Map shader
+- [x] Text overlay with built-in fonts
+- [x] Undo/Redo history
+- [x] PWA support (offline app shell)
 - [ ] **Watermark** support
-- [ ] **Batch processing** — apply effects to multiple images
-- [ ] **Undo/Redo** history
-- [ ] **Mobile-optimized** UI
-- [ ] **PWA** support (offline use)
 - [ ] **Keyboard shortcuts**
 
 See the [open issues](https://github.com/hasanmorina/shader-lab/issues) for community-requested features.
@@ -175,10 +191,20 @@ shader-lab/
 │   │   └── deploy.yml         # Auto-deploy to GitHub Pages
 │   └── pull_request_template.md
 ├── public/
-│   └── favicon.svg
+│   ├── favicon.svg
+│   ├── manifest.webmanifest
+│   └── sw.js
 ├── src/
 │   ├── main.jsx               # React entry
-│   └── ShaderLab.jsx          # Entire app (single-file architecture)
+│   ├── ShaderLab.jsx          # App shell
+│   ├── FiltersWorkspace.jsx   # WebGL filter studio
+│   └── editorHistory.js       # Undo/redo state contracts
+├── e2e/
+│   ├── smoke.spec.js          # Browser smoke tests
+│   └── pwa.spec.js            # Production offline smoke
+├── test/
+│   ├── editor-history.test.js
+│   └── lib-contracts.test.js
 ├── index.html
 ├── package.json
 ├── vite.config.js
